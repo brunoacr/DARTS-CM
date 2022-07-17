@@ -197,7 +197,7 @@ def main():
 
 def compute_unrolled_step(x_train, y_train, x_valid, y_valid, w_var, train_loss, lr):
     arch_var = utils.get_var(tf.compat.v1.trainable_variables(), "arch_var")[1]
-
+    print(arch_var)
     _, unrolled_train_loss = Model(
         x_train,
         y_train,

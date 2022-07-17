@@ -34,36 +34,41 @@ def MixedOp(x, C_out, stride, index, reduction):
         if 'pool' in primitive:
             op = slim.batch_norm(op)
 
-        mask = [i == index for i in range(len(PRIMITIVES))]
+        mask = [i == index for i in range(len(PRIMITIVES))] # TODO [INFO] getting the arch weight for current op
         w_mask = tf.constant(mask, tf.bool)
         w = tf.boolean_mask(tensor=weight, mask=w_mask)
-        ops.append(op * w)
+        ops.append(op * w) # TODO [INFO] getting the op feature map weighed by the arch weigts
         index += 1
-    return tf.add_n(ops)
+    return tf.add_n(ops)  # TODO [INFO] returning the sum of all partial feature maps
 
 # TODO [INFO] This
 
 def Cell(s0, s1, cells_num, multiplier, C_out, reduction, reduction_prev):
     print('im a cell :)')
+
     if reduction_prev:
-        s0 = FactorizedReduce(s0, C_out)
+        s0 = FactorizedReduce(s0, C_out) # TODO [Info] s0 and s1 represent the nodes in the DARTS graph
     else:
         s0 = ReLUConvBN(s0, C_out)
     s1 = ReLUConvBN(s1, C_out)
 
-    state = [s0, s1]
-    offset = 0
+    state = [s0, s1]  # TODO [info]  state = [CELL(K-2), CELL(K-1), Node 0, Node 1, Node 2, Node 3 ]
+    offset = 0       # TODO [!! info]  ALL NODE IN THE GRAPH ARE A SUM MIXED OPS FROM ALL PREVIOUS NODES (INC S0 AND S1)
     for i in range(cells_num):
         temp = []
         for j in range(2 + i):
             stride = [2, 2] if reduction and j < 2 else [1, 1]
-            temp.append(MixedOp(state[j], C_out, stride, offset + j, reduction))
+            temp.append(MixedOp(state[j], C_out, stride, offset + j, reduction))    # TODO [info] offset+j simply ensure each MixedOp gets an increasing id (0-13)
+                                                                                    # TODO [info] there are 14 mixed ops, 2 for node 0, 3 for node 1, 4 for node 2 and 5 for node 3
+
         offset += len(state)
         state.append(tf.add_n(temp))
-    out = tf.concat(state[-multiplier:], axis=-1)
+
+    out = tf.concat(state[-multiplier:], axis=-1) # TODO [INFO] Output of cell is concatenation of Nodes 0-3
     return out
 
-# TODO 0,1,
+
+
 def Model(x, y, is_training, first_C, class_num, layer_num, cells_num=4, multiplier=4, stem_multiplier=3, name="model"):
     with tf.compat.v1.variable_scope(name, reuse=tf.compat.v1.AUTO_REUSE):
         with slim.arg_scope([slim.conv2d, slim.separable_conv2d], activation_fn=None, padding='SAME',
@@ -81,7 +86,7 @@ def Model(x, y, is_training, first_C, class_num, layer_num, cells_num=4, multipl
                         reduction = True
                     else:
                         reduction = False
-                    s0, s1 = s1, Cell(s0, s1, cells_num, multiplier, C_curr, reduction, reduction_prev)
+                    s0, s1 = s1, Cell(s0, s1, cells_num, multiplier, C_curr, reduction, reduction_prev) # TODO [INFO] S1 is the feature maps of the previous cell, and S0 of the one before
                     reduction_prev = reduction
                 out = tf.reduce_mean(input_tensor=s1, axis=[1, 2], keepdims=True, name='global_pool')
                 logits = slim.conv2d(out, class_num, [1, 1], activation_fn=None, normalizer_fn=None,
@@ -116,6 +121,7 @@ def get_genotype(sess, cells_num=4, multiplier=4):
         offset = 0
         genotype = []
         arch_var_name, arch_var = utils.get_var(tf.compat.v1.trainable_variables(), 'arch_var')
+        print(arch_var)
         for i in range(cells_num):
             edges = []
             edges_confident = []

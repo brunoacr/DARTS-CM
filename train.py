@@ -10,9 +10,8 @@ import tensorflow as tf
 from model import *
 from data_utils import read_data
 from collections import namedtuple
-import genotypes 
+import genotypes
 from datetime import datetime
-
 
 parser = argparse.ArgumentParser("cifar")
 parser.add_argument('--data', type=str, default='./data/cifar10', help='location of the data corpus')
@@ -36,112 +35,122 @@ parser.add_argument('--seed', type=int, default=0, help='random seed')
 parser.add_argument('--arch', type=str, default='DARTS', help='which architecture to use')
 parser.add_argument('--grad_clip', type=float, default=5, help='gradient clipping')
 args = parser.parse_args()
-output_dir='./outputs/test_model/'
+output_dir = './outputs/test_model/'
 if not os.path.isdir(output_dir):
-	print("Path {} does not exist. Creating.".format(output_dir))
-	os.makedirs(output_dir)
+    print("Path {} does not exist. Creating.".format(output_dir))
+    os.makedirs(output_dir)
 tf.compat.v1.set_random_seed(args.seed)
 TIMESTAMP = "{0:%Y-%m-%dT%H-%M-%S/}".format(datetime.now())
-CLASS_NUM=10
+CLASS_NUM = 10
+
+
 def main():
-	global_step = tf.compat.v1.train.get_or_create_global_step()
+    global_step = tf.compat.v1.train.get_or_create_global_step()
 
-	images, labels = read_data(args.data)
-	train_dataset = tf.data.Dataset.from_tensor_slices((images["train"],labels["train"]))
-	train_dataset=train_dataset.map(_pre_process).shuffle(5000).batch(args.batch_size)
-	train_iter=tf.compat.v1.data.make_initializable_iterator(train_dataset)
-	x_train,y_train=train_iter.get_next()
+    images, labels = read_data(args.data)
+    train_dataset = tf.data.Dataset.from_tensor_slices((images["train"], labels["train"]))
+    train_dataset = train_dataset.map(_pre_process).shuffle(5000).batch(args.batch_size)
+    train_iter = tf.compat.v1.data.make_initializable_iterator(train_dataset)
+    x_train, y_train = train_iter.get_next()
 
-	test_dataset = tf.data.Dataset.from_tensor_slices((images["test"],labels["test"]))
-	test_dataset=test_dataset.shuffle(5000).batch(args.batch_size)
-	test_iter=tf.compat.v1.data.make_initializable_iterator(test_dataset)
-	x_test,y_test=test_iter.get_next()
+    test_dataset = tf.data.Dataset.from_tensor_slices((images["test"], labels["test"]))
+    test_dataset = test_dataset.shuffle(5000).batch(args.batch_size)
+    test_iter = tf.compat.v1.data.make_initializable_iterator(test_dataset)
+    x_test, y_test = test_iter.get_next()
 
-	genotype = eval("genotypes.%s" % args.arch)
-	train_logits,aux_logits=Model(x_train,y_train,True,args.init_channels,CLASS_NUM,args.layers,args.auxiliary,genotype)
-	train_loss=tf.reduce_mean(input_tensor=tf.nn.sparse_softmax_cross_entropy_with_logits(labels=y_train, logits=train_logits))
+    genotype = eval("genotypes.%s" % args.arch)
+    train_logits, aux_logits = Model(x_train, y_train, True, args.init_channels, CLASS_NUM, args.layers, args.auxiliary,
+                                     genotype)
+    train_loss = tf.reduce_mean(
+        input_tensor=tf.nn.sparse_softmax_cross_entropy_with_logits(labels=y_train, logits=train_logits))
 
-	w_regularization_loss = tf.add_n(utils.get_var(tf.compat.v1.losses.get_regularization_losses(), 'lw')[1])
-	train_loss+=1e4*args.weight_decay*w_regularization_loss
-	# tf.summary.scalar('train_loss', train_loss)
+    w_regularization_loss = tf.add_n(utils.get_var(tf.compat.v1.losses.get_regularization_losses(), 'lw')[1])
+    train_loss += 1e4 * args.weight_decay * w_regularization_loss
+    # tf.summary.scalar('train_loss', train_loss)
 
-	if args.auxiliary:
-		loss_aux = tf.reduce_mean(input_tensor=tf.nn.sparse_softmax_cross_entropy_with_logits(labels=y_train, logits=aux_logits))
-		train_loss += args.auxiliary_weight*loss_aux
+    if args.auxiliary:
+        loss_aux = tf.reduce_mean(
+            input_tensor=tf.nn.sparse_softmax_cross_entropy_with_logits(labels=y_train, logits=aux_logits))
+        train_loss += args.auxiliary_weight * loss_aux
 
-	lr=tf.compat.v1.train.cosine_decay(args.learning_rate,global_step,50000/args.batch_size*args.epochs)
-	accuracy=tf.reduce_mean(input_tensor=tf.cast(tf.nn.in_top_k(predictions=train_logits, targets=y_train, k=1), tf.float32))	
+    lr = tf.compat.v1.train.cosine_decay(args.learning_rate, global_step, 50000 / args.batch_size * args.epochs)
+    accuracy = tf.reduce_mean(
+        input_tensor=tf.cast(tf.nn.in_top_k(predictions=train_logits, targets=y_train, k=1), tf.float32))
 
-	test_logits,_=Model(x_test,y_test,False,args.init_channels,CLASS_NUM,args.layers,args.auxiliary,genotype)
-	test_accuracy=tf.reduce_mean(input_tensor=tf.cast(tf.nn.in_top_k(predictions=test_logits, targets=y_test, k=1), tf.float32))
-	test_accuracy_top5=tf.reduce_mean(input_tensor=tf.cast(tf.nn.in_top_k(predictions=test_logits, targets=y_test, k=5), tf.float32))
-	tf.compat.v1.summary.scalar('test_accuracy_top1', test_accuracy)
+    test_logits, _ = Model(x_test, y_test, False, args.init_channels, CLASS_NUM, args.layers, args.auxiliary, genotype)
+    test_accuracy = tf.reduce_mean(
+        input_tensor=tf.cast(tf.nn.in_top_k(predictions=test_logits, targets=y_test, k=1), tf.float32))
+    test_accuracy_top5 = tf.reduce_mean(
+        input_tensor=tf.cast(tf.nn.in_top_k(predictions=test_logits, targets=y_test, k=5), tf.float32))
+    tf.compat.v1.summary.scalar('test_accuracy_top1', test_accuracy)
+
+    with tf.control_dependencies(tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.UPDATE_OPS)):
+        opt = tf.compat.v1.train.MomentumOptimizer(lr, args.momentum)
+        opt = opt.minimize(train_loss, global_step)
+
+    merged = tf.compat.v1.summary.merge_all()
+
+    config = tf.compat.v1.ConfigProto()
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    config.gpu_options.allow_growth = True
+    sess = tf.compat.v1.Session(config=config)
+
+    writer = tf.compat.v1.summary.FileWriter(output_dir + TIMESTAMP, sess.graph)
+    saver = tf.compat.v1.train.Saver(max_to_keep=1)
+    sess.run(tf.compat.v1.global_variables_initializer())
+    test_batch = 0
+    for e in range(args.epochs):
+        objs = utils.AvgrageMeter()
+        top1 = utils.AvgrageMeter()
+        sess.run(train_iter.initializer)
+        while True:
+            try:
+                _, loss, acc, crrunt_lr, gs = sess.run([opt, train_loss, accuracy, lr, global_step])
+                objs.update(loss, args.batch_size)
+                top1.update(acc, args.batch_size)
+                if gs % args.report_freq == 0:
+                    print("epochs {} steps {} currnt lr is {:.3f}  loss is {}  train_acc is {}".format(e, gs, crrunt_lr,
+                                                                                                       objs.avg,
+                                                                                                       top1.avg))
+            except tf.errors.OutOfRangeError:
+                print('-' * 80)
+                print("end of an train epoch")
+                break
+        if e % 5 == 0:
+            test_top1 = utils.AvgrageMeter()
+            sess.run(test_iter.initializer)
+            while True:
+                try:
+                    test_batch += 1
+                    summary, test_acc = sess.run([merged, test_accuracy])
+                    test_top1.update(test_acc, args.batch_size)
+                    if test_batch % 100:
+                        writer.add_summary(summary, test_batch)
+                except tf.errors.OutOfRangeError:
+                    print("******************* epochs {}   test_acc is {}".format(e, test_top1.avg))
+                    saver.save(sess, output_dir + "model", test_batch)
+                    print('-' * 80)
+                    print("end of an test epoch")
+                    break
 
 
-	with tf.control_dependencies(tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.UPDATE_OPS)):
-		opt=tf.compat.v1.train.MomentumOptimizer(lr,args.momentum)
-		opt=opt.minimize(train_loss,global_step)
+def _pre_process(x, label):
+    cutout_length = args.cutout_length
+    x = tf.pad(tensor=x, paddings=[[4, 4], [4, 4], [0, 0]])
+    x = tf.image.random_crop(x, [32, 32, 3])
+    x = tf.image.random_flip_left_right(x)
+    if cutout_length is not None:
+        mask = tf.ones([cutout_length, cutout_length], dtype=tf.int32)
+        start = tf.random.uniform([2], minval=0, maxval=32, dtype=tf.int32)
+        mask = tf.pad(tensor=mask, paddings=[[cutout_length + start[0], 32 - start[0]],
+                                             [cutout_length + start[1], 32 - start[1]]])
+        mask = mask[cutout_length: cutout_length + 32,
+               cutout_length: cutout_length + 32]
+        mask = tf.reshape(mask, [32, 32, 1])
+        mask = tf.tile(mask, [1, 1, 3])
+        x = tf.compat.v1.where(tf.equal(mask, 0), x=x, y=tf.zeros_like(x))
+    return x, label
 
-	merged = tf.compat.v1.summary.merge_all()
 
-
-	config = tf.compat.v1.ConfigProto()
-	os.environ["CUDA_VISIBLE_DEVICES"] =  str(args.gpu)
-	config.gpu_options.allow_growth = True
-	sess=tf.compat.v1.Session(config=config)
-
-	writer = tf.compat.v1.summary.FileWriter(output_dir+TIMESTAMP,sess.graph)
-	saver = tf.compat.v1.train.Saver(max_to_keep=1)
-	sess.run(tf.compat.v1.global_variables_initializer())
-	test_batch=0
-	for e in range(args.epochs):
-		objs = utils.AvgrageMeter()
-		top1 = utils.AvgrageMeter()
-		sess.run(train_iter.initializer)
-		while True:
-			try:
-				_,loss, acc,crrunt_lr,gs=sess.run([opt,train_loss,accuracy,lr,global_step])
-				objs.update(loss, args.batch_size)
-				top1.update(acc, args.batch_size)
-				if gs % args.report_freq==0:
-					print("epochs {} steps {} currnt lr is {:.3f}  loss is {}  train_acc is {}".format(e,gs,crrunt_lr,objs.avg,top1.avg))
-			except tf.errors.OutOfRangeError:
-				print('-'*80)
-				print("end of an train epoch")
-				break
-		if e % 5 ==0:
-			test_top1 = utils.AvgrageMeter()
-			sess.run(test_iter.initializer)
-			while True:
-				try:
-					test_batch+=1
-					summary,test_acc=sess.run([merged,test_accuracy])
-					test_top1.update(test_acc, args.batch_size)
-					if test_batch % 100:
-						writer.add_summary(summary, test_batch)
-				except tf.errors.OutOfRangeError:
-					print("******************* epochs {}   test_acc is {}".format(e,test_top1.avg))
-					saver.save(sess, output_dir+"model",test_batch)
-					print('-'*80)
-					print("end of an test epoch")
-					break
-
-def _pre_process(x,label):
-	cutout_length=args.cutout_length
-	x = tf.pad(tensor=x, paddings=[[4, 4], [4, 4], [0, 0]])
-	x = tf.image.random_crop(x, [32, 32, 3])
-	x = tf.image.random_flip_left_right(x)
-	if cutout_length is not None:
-		mask = tf.ones([cutout_length, cutout_length], dtype=tf.int32)
-		start = tf.random.uniform([2], minval=0, maxval=32, dtype=tf.int32)
-		mask = tf.pad(tensor=mask, paddings=[[cutout_length + start[0], 32 - start[0]],
-		                     [cutout_length + start[1], 32 - start[1]]])
-		mask = mask[cutout_length: cutout_length + 32,
-		            cutout_length: cutout_length + 32]
-		mask = tf.reshape(mask, [32, 32, 1])
-		mask = tf.tile(mask, [1, 1, 3])
-		x = tf.compat.v1.where(tf.equal(mask, 0), x=x, y=tf.zeros_like(x))
-	return x,label
 if __name__ == '__main__':
-	main() 
-
+    main()
