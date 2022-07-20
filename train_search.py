@@ -1,3 +1,4 @@
+import math
 import os
 import tensorflow as tf
 import sys
@@ -6,30 +7,38 @@ import glob
 import numpy as np
 import logging
 import argparse
+
+import visualize
 from model_search import *
 from data_utils import read_data
 from datetime import datetime
 import utils
-# from mapping_network_utils.activations_extractor import ActivationsExtractor
+from mapping_network_utils.activations_extractor import ActivationsExtractor
+from main_network.main_network_utils import load_dataset
+import more_itertools
+
 # PARAMS
 EXTRACTOR_PATH = './extractors/xtrains_extractor'
-DATA_PATH = './data/cifar10'
-DATASET = 'VCAB'
-SEC_LABELS = ['TiledRoof']
+DATA_PATH = './data/XTRAINS_MINI'
+DATASET = 'XTRAINS'
+SEC_LABELS = ['WarTrain']
 
-tf.compat.v1.disable_eager_execution()
+
+# De-comment to run on CPU
+# os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+
 
 def parse_args():
     parser = argparse.ArgumentParser("cifar")
     parser.add_argument("--data", type=str, default=DATA_PATH, help="location of the data corpus")
-    parser.add_argument("--batch_size", type=int, default=16, help="batch size")
+    parser.add_argument("--batch_size", type=int, default=32, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=0.025, help="init learning rate")
-    parser.add_argument("--learning_rate_min", type=float, default=0.001, help="min learning rate")
+    parser.add_argument("--learning_rate_min", type=float, default=0.25, help="min learning rate")
     parser.add_argument("--momentum", type=float, default=0.9, help="momentum")
     parser.add_argument("--weight_decay", type=float, default=3e-4, help="weight decay")
     parser.add_argument("--report_freq", type=float, default=200, help="report frequency")
     parser.add_argument("--gpu", type=int, default=1, help="gpu device id")
-    parser.add_argument("--epochs", type=int, default=50, help="num of training epochs")
+    parser.add_argument("--epochs", type=int, default=100, help="num of training epochs")
     parser.add_argument("--init_channels", type=int, default=16, help="num of init channels")
     parser.add_argument("--layers", type=int, default=3, help="total number of layers")
     parser.add_argument("--model_path", type=str, default="saved_models", help="path to save the model")
@@ -39,7 +48,7 @@ def parse_args():
     parser.add_argument("--save", type=str, default="EXP", help="experiment name")
     parser.add_argument("--seed", type=int, default=2, help="random seed")
     parser.add_argument("--grad_clip", type=float, default=5, help="gradient clipping")
-    parser.add_argument("--train_portion", type=float, default=0.5, help="portion of training data")
+    parser.add_argument("--train_portion", type=float, default=0.8, help="portion of training data")
     parser.add_argument("--unrolled", action="store_true", default=False,
                         help="use one-step unrolled validation loss", )
     parser.add_argument("--arch_learning_rate", type=float, default=3e-4, help="learning rate for arch encoding")
@@ -48,14 +57,14 @@ def parse_args():
     # BR args - start
     parser.add_argument('--extractor', type=str, default=EXTRACTOR_PATH,
                         help='location of the activations extractor')
-    parser.add_argument('--sec_labels', type=str, nargs='+', help='Secondary labels mapping model should learn')
+    parser.add_argument('--sec_labels', type=str, default=SEC_LABELS, nargs='+',
+                        help='Secondary labels mapping model should learn')
     parser.add_argument('--dataset', type=str, default=DATASET, choices=['VCAB', 'XTRAINS'])
     # BR args - end
     return parser.parse_args()
 
 
 args = parse_args()
-
 tf.compat.v1.set_random_seed(args.seed)
 output_dir = "./outputs/train_model/"
 if not os.path.isdir(output_dir):
@@ -63,227 +72,171 @@ if not os.path.isdir(output_dir):
     os.makedirs(output_dir)
 
 TIMESTAMP = "{0:%Y-%m-%dT%H-%M-%S/}".format(datetime.now())
-CLASS_NUM = 10
+CLASS_NUM = len(args.sec_labels)
+print('CLASS_NUM: {}'.format(CLASS_NUM))
+
+
+def pad(a, div):
+    if len(a) % div == 0:
+        return a
+    ix = range(len(a))
+    choices = np.random.choice(ix, size=div - (len(a) % div))
+    a.extend([a[c] for c in choices])
+    return a
+
+
+def preprocess(x, y, batch_size):
+    x, y = shuffle_together(x, y)
+    x = batch(x, batch_size)
+    y = batch(y, batch_size)
+    return tf.constant(np.stack(x), dtype='float32'), np.stack(y)
+
+
+def batch(a, batch_size):
+    a = pad(a, batch_size)
+    out = [a[0:batch_size]]
+    for i in range(batch_size, len(a), batch_size):
+        ap = a[i: i + batch_size]
+        out.append(ap)
+    return out
+
+
+def shuffle_together(a, b):
+    assert len(a) == len(b)
+    p = list(np.random.permutation(len(a)))
+    a = [a[i] for i in p]
+    b = [b[i] for i in p]
+    return a, b
 
 
 def main():
-    global_step = tf.compat.v1.train.get_or_create_global_step()
+    images, labels = load_dataset(args.dataset, args.data, val_split=1 - args.train_portion, test_split=0,
+                                  sec_labels=True,
+                                  filter_sec_labels=args.sec_labels)
 
-    # BR START
-    # extractor = ActivationsExtractor.load(args.extractor)  # load extractor
-    # BR END
+    x_train, y_train = preprocess(images['train'], labels['train'], args.batch_size)
+    x_val, y_val = preprocess(images['valid'], labels['valid'], args.batch_size)
 
-    images, labels = read_data(args.data, args.train_portion)
-    train_dataset = tf.data.Dataset.from_tensor_slices((images["train"], labels["train"]))
-    train_dataset = train_dataset.map(_pre_process).shuffle(100).batch(args.batch_size)
-    train_iter = tf.compat.v1.data.make_initializable_iterator(train_dataset)
-    x_train, y_train = train_iter.get_next()
+    model_loss = tf.metrics.binary_crossentropy
+    main_model = Model(model_loss, args.init_channels, CLASS_NUM, args.layers)
 
-    valid_dataset = tf.data.Dataset.from_tensor_slices((images["valid"], labels["valid"]))
-    valid_dataset = valid_dataset.shuffle(100).batch(args.batch_size)
-    valid_iter = tf.compat.v1.data.make_initializable_iterator(valid_dataset)
-    x_valid, y_valid = valid_iter.get_next()
+    extractor = ActivationsExtractor.load(args.extractor)  # load extractor
 
-    # TODO [CRUCIAL INFO] all methods from tensorflow.python.ops create an element in a computational graph,
-    # TODO [CRUCIAL INFO], that can be called multiple times later, they are Operations.
-    # TODO [INFO] Each call to Model is returning a forward pass of the model, the third argument (True) means its
-    # TODO [INFO] training (aka updating the weights). Bellow, where its getting the val loss, that parameter is False
-    logits, train_loss = Model(
-        x_train, y_train, True, args.init_channels, CLASS_NUM, args.layers
-    )
-
-    lr = tf.compat.v1.train.cosine_decay(
+    init = extractor.extract_activations(x_train[0])
+    main_model(init)  # builds model
+    main_model.summary()
+    print(CLASS_NUM)
+    lr = tf.keras.optimizers.schedules.CosineDecay(
         args.learning_rate,
-        global_step,
-        50000 / args.batch_size * args.epochs,
-        args.learning_rate_min,
+        ((len(x_train) + len(x_val)) / args.batch_size) * args.epochs,
+        args.learning_rate_min
     )
 
-    accuracy = tf.reduce_mean(input_tensor=tf.cast(tf.nn.in_top_k(predictions=logits, targets=y_train, k=1), tf.float32))
-    w_regularization_loss = tf.add_n(
-        utils.get_var(tf.compat.v1.losses.get_regularization_losses(), "model")[1]
-    )
-    train_loss += 1e4 * args.weight_decay * w_regularization_loss
-    tf.compat.v1.summary.scalar("train_loss", train_loss)
+    arch_opt = tf.keras.optimizers.Adam(args.arch_learning_rate, 0.5, 0.999)
+    model_opt = tf.keras.optimizers.SGD(learning_rate=lr, momentum=args.momentum)
 
-    w_var = utils.get_var(tf.compat.v1.trainable_variables(), "model")[1]
-
-    # TODO [INFO] Update arch weights
-    leader_opt = compute_unrolled_step(
-        x_train, y_train, x_valid, y_valid, w_var, train_loss, lr
-    )
-
-    # TODO [INFO] Update model weights
-    with tf.control_dependencies(
-            [leader_opt, tf.group(*tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.UPDATE_OPS))]
-    ):
-        follower_opt = tf.compat.v1.train.MomentumOptimizer(lr, args.momentum)
-        follower_grads = tf.gradients(ys=train_loss, xs=w_var)
-        clipped_gradients, norm = tf.clip_by_global_norm(follower_grads, args.grad_clip)
-        follower_opt = follower_opt.apply_gradients(
-            zip(clipped_gradients, w_var), global_step
-        )
-
-    infer_logits, infer_loss = Model(
-        x_valid, y_valid, False, args.init_channels, CLASS_NUM, args.layers
-    )
-    valid_accuracy = tf.reduce_mean(
-        input_tensor=tf.cast(tf.nn.in_top_k(predictions=infer_logits, targets=y_valid, k=1), tf.float32)
-    )
-
-    merged = tf.compat.v1.summary.merge_all()
-
-    config = tf.compat.v1.ConfigProto()
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-
-    config.gpu_options.allow_growth = True
-    sess = tf.compat.v1.Session(config=config)
     if not tf.test.is_gpu_available():
-        raise Exception('Tensorflow not using GPU!')
-
-    writer = tf.compat.v1.summary.FileWriter(output_dir + TIMESTAMP, sess.graph)
-    saver = tf.compat.v1.train.Saver(max_to_keep=1)
-
-    sess.run(tf.compat.v1.global_variables_initializer())
-    # saver.restore(sess, tf.train.latest_checkpoint(output_dir))
+        raise Warning('Tensorflow not using GPU!')
 
     genotype_record_file = open(output_dir + "genotype_record_file.txt", "w")
-    for e in range(args.epochs):
+    gs = 0
+    for epoch in range(args.epochs):
         print('start of an epoch')
         objs = utils.AvgrageMeter()
         top1 = utils.AvgrageMeter()
         test_top1 = utils.AvgrageMeter()
-        sess.run([train_iter.initializer, valid_iter.initializer])
-        while True:
-            try:
-                _, loss, acc, crrunt_lr, gs = sess.run(
-                    [follower_opt, train_loss, accuracy, lr, global_step]
-                ) # TODO [INFO] This updates the arch and model weights and retrieves train loss and accuracy
-                objs.update(loss, args.batch_size)
-                top1.update(acc, args.batch_size)
-                if gs % args.report_freq == 0:
-                    print(
-                        "epochs {} steps {} currnt lr is {:.3f}  loss is {}  train_acc is {}".format(
-                            e, gs, crrunt_lr, objs.avg, top1.avg
-                        )
+
+        for i in range(len(x_train)):
+            x, y = extractor.extract_activations(x_train[i]), y_train[i]
+            x_v, y_v = extractor.extract_activations(x_val[i % len(x_val)]), y_val[i % len(y_val)]
+
+            with tf.GradientTape(persistent=True) as tape:
+                # get train loss
+                # logits, train_loss = main_model.compute_loss(x, y, args.weight_decay, return_logits=True)
+                logits = main_model.call(x)
+                print('logits = {}'.format(logits))
+                print('label  = {}'.format(y))
+                train_loss = model_loss(y,logits)
+                print('train loss = {}'.format(train_loss))
+                with tape.stop_recording():
+                    watched = tape.watched_variables()
+                    train_grads = tape.gradient(train_loss, main_model.get_model_weights())
+
+                    # ARCH STEP
+                    clone = main_model.deep_clone(init)
+                    model_opt.apply_gradients(zip(train_grads, clone.get_model_weights()))  # w' =  w − ξ ∇w( L_train(w, α) )
+
+                    valid_loss = clone.compute_loss(x_v, y_v, args.weight_decay)
+
+            valid_grads = tape.gradient(valid_loss, clone.get_model_weights())  # ∇w'( L_val(w', α) )
+
+            e = 1e-2
+            E = e / tf.linalg.global_norm(valid_grads)
+            clone_pos = clone.deep_clone(init)
+            clone_neg = clone.deep_clone(init)
+            opt_pos = tf.keras.optimizers.SGD(E)
+            opt_pos.apply_gradients(zip(valid_grads, clone_pos.get_model_weights()))  # W+ stored in clone_pos
+            opt_neg = tf.keras.optimizers.SGD(-E)
+            opt_neg.apply_gradients(zip(valid_grads, clone_neg.get_model_weights()))  # W- stored in clone_neg
+
+            with tf.GradientTape(persistent=True) as tape:
+                pos_train_loss = clone_pos.compute_loss(x, y, args.weight_decay)
+                neg_train_loss = clone_neg.compute_loss(x, y, args.weight_decay)
+
+            train_grads_pos = tape.gradient(pos_train_loss, clone_pos.get_arch_weights())  # ∇α L_train(w+, α)
+            train_grads_neg = tape.gradient(neg_train_loss, clone_neg.get_arch_weights())  # ∇α L_train(w-, α)
+
+            with tf.GradientTape() as tape:
+                clone_val_loss = clone.compute_loss(x_v, y_v, args.weight_decay)
+
+            arch_grads = tape.gradient(clone_val_loss, clone.get_arch_weights())  # ∇α( L_val(w', α))
+
+            for ix, grad in enumerate(arch_grads):  # ~~ ∇α( L_val(w*, α) ), w* being fully trained model weights
+                arch_grads[ix] = arch_grads[ix] - args.learning_rate * tf.divide(
+                    train_grads_pos[ix] - train_grads_neg[ix], 2 * E)
+
+            arch_opt.apply_gradients(
+                zip(arch_grads, main_model.get_arch_weights()))  # <-- updating main models arch weights
+
+            # MODEL STEP
+            model_opt.apply_gradients(zip(train_grads, main_model.get_model_weights()))
+            acc = tf.reduce_mean(
+                input_tensor=tf.cast(tf.nn.in_top_k(predictions=logits, targets=np.asarray(y).flatten(), k=1),
+                                     tf.float32))
+
+            objs.update(np.mean(train_loss), args.batch_size)
+            top1.update(acc, args.batch_size)
+
+            if gs % args.report_freq == 0 or True:
+                print(
+                    "epochs {} steps {} currnt lr is {:.3f}  loss is {}  train_acc is {}".format(
+                        epoch, gs, lr(epoch), objs.avg, top1.avg
                     )
-                    summary = sess.run(merged)
-                    writer.add_summary(summary, gs)
-            except tf.errors.OutOfRangeError:
-                print("-" * 80)
-                print("end of an epoch")
-                break
-        genotype = get_genotype(sess)
+                )
+            gs += 1
+
+        print("-" * 80)
+        print("end of an epoch")
+
+        genotype = main_model.get_genotype()
         print("genotype is {}".format(genotype))
         genotype_record_file.write("{}".format(genotype) + "\n")
 
-        valid_top1 = utils.AvgrageMeter()
-        sess.run(valid_iter.initializer)
-        while True:
-            try:
-                valid_acc = sess.run(valid_accuracy)
-                test_top1.update(valid_acc, args.batch_size)
-            except tf.errors.OutOfRangeError:
-                print(
-                    "******************* epochs {}   valid_acc is {}".format(
-                        e, test_top1.avg
-                    )
-                )
-                saver.save(sess, output_dir + "model", gs)
-                print("-" * 80)
-                print("end of an valid epoch")
-                break
+        for i in range(len(x_val)):
+            x_v, y_v = extractor.extract_activations(x_val[i]), y_val[i]
+            logits = main_model(x_v)
+            valid_acc = tf.reduce_mean(
+                input_tensor=tf.cast(tf.nn.in_top_k(predictions=logits, targets=np.asarray(y_v).flatten(), k=1),
+                                     tf.float32))
+            test_top1.update(valid_acc, args.batch_size)
 
-
-def compute_unrolled_step(x_train, y_train, x_valid, y_valid, w_var, train_loss, lr):
-    arch_var = utils.get_var(tf.compat.v1.trainable_variables(), "arch_var")[1]
-    print(arch_var)
-    _, unrolled_train_loss = Model(
-        x_train,
-        y_train,
-        True,
-        args.init_channels,
-        CLASS_NUM,
-        args.layers,
-        name="unrolled_model",
-    )
-    unrolled_w_var = utils.get_var(tf.compat.v1.trainable_variables(), "unrolled_model")[1]
-    cpoy_weight_opts = [v_.assign(v) for v_, v in zip(unrolled_w_var, w_var)]
-
-    # w'
-    with tf.control_dependencies(cpoy_weight_opts):
-        unrolled_optimizer = tf.compat.v1.train.GradientDescentOptimizer(lr)
-        unrolled_optimizer = unrolled_optimizer.minimize(
-            unrolled_train_loss, var_list=unrolled_w_var
+        print(
+            "******************* epochs {}   valid_acc is {}".format(
+                epoch, test_top1.avg
+            )
         )
-
-    _, valid_loss = Model(
-        x_valid,
-        y_valid,
-        True,
-        args.init_channels,
-        CLASS_NUM,
-        args.layers,
-        name="unrolled_model",
-    )
-    tf.compat.v1.summary.scalar("valid_loss", valid_loss)
-
-    with tf.control_dependencies([unrolled_optimizer]):
-        valid_grads = tf.gradients(ys=valid_loss, xs=unrolled_w_var)
-
-    r = 1e-2
-    R = r / tf.linalg.global_norm(valid_grads)
-
-    optimizer_pos = tf.compat.v1.train.GradientDescentOptimizer(R)
-    optimizer_pos = optimizer_pos.apply_gradients(zip(valid_grads, w_var))
-
-    optimizer_neg = tf.compat.v1.train.GradientDescentOptimizer(-2 * R)
-    optimizer_neg = optimizer_neg.apply_gradients(zip(valid_grads, w_var))
-
-    optimizer_back = tf.compat.v1.train.GradientDescentOptimizer(R)
-    optimizer_back = optimizer_back.apply_gradients(zip(valid_grads, w_var))
-
-    with tf.control_dependencies([optimizer_pos]):
-        train_grads_pos = tf.gradients(ys=train_loss, xs=arch_var)
-        with tf.control_dependencies([optimizer_neg]):
-            train_grads_neg = tf.gradients(ys=train_loss, xs=arch_var)
-            with tf.control_dependencies([optimizer_back]):
-                leader_opt = tf.compat.v1.train.AdamOptimizer(args.arch_learning_rate, 0.5, 0.999)
-                leader_grads = leader_opt.compute_gradients(valid_loss, var_list=arch_var)
-    for i, (g, v) in enumerate(leader_grads):
-        leader_grads[i] = (
-            g
-            - args.learning_rate
-            * tf.divide(train_grads_pos[i] - train_grads_neg[i], 2 * R),
-            v,
-        )
-
-    leader_opt = leader_opt.apply_gradients(leader_grads) # TODO [INFO] This updates the arch weights
-    return leader_opt
-
-
-def _pre_process(x, label):
-    cutout_length = args.cutout_length
-    x = tf.pad(tensor=x, paddings=[[4, 4], [4, 4], [0, 0]])
-    x = tf.image.random_crop(x, [32, 32, 3])
-    x = tf.image.random_flip_left_right(x)
-    if cutout_length is not None:
-        mask = tf.ones([cutout_length, cutout_length], dtype=tf.int32)
-        start = tf.random.uniform([2], minval=0, maxval=32, dtype=tf.int32)
-        mask = tf.pad(
-            tensor=mask,
-            paddings=[
-                [cutout_length + start[0], 32 - start[0]],
-                [cutout_length + start[1], 32 - start[1]],
-            ],
-        )
-        mask = mask[
-               cutout_length: cutout_length + 32, cutout_length: cutout_length + 32
-               ]
-        mask = tf.reshape(mask, [32, 32, 1])
-        mask = tf.tile(mask, [1, 1, 3])
-        x = tf.compat.v1.where(tf.equal(mask, 0), x=x, y=tf.zeros_like(x))
-    return x, label
+        print("-" * 80)
+        print("end of a valid epoch")
 
 
 if __name__ == "__main__":

@@ -3,53 +3,81 @@ import sys
 from tensorflow.python.ops import nn
 import numpy as np
 import tensorflow as tf
-import tf_slim as slim
+from tensorflow.keras.regularizers import l2
 
 OPS = {
-  'none' : lambda x, C, stride: Zero(x,stride),
-  'avg_pool_3x3' : lambda x, C, stride: slim.avg_pool2d(x,[3,3], stride=stride,padding='SAME'),
-  'max_pool_3x3' : lambda x, C, stride: slim.max_pool2d(x,[3,3], stride=stride,padding='SAME'),
-  'skip_connect' : lambda x, C, stride: tf.identity(x) if stride == [1,1] else FactorizedReduce(x, C),
-  'sep_conv_3x3' : lambda x, C, stride: SepConv(x, C, [3,3], stride),
-  'sep_conv_5x5' : lambda x, C, stride: SepConv(x, C, [5,5], stride),
-  'sep_conv_7x7' : lambda x, C, stride: SepConv(x, C, [7,7], stride),
-  'dil_conv_3x3' : lambda x, C, stride: DilConv(x, C, [3,3], stride,2),
-  'dil_conv_5x5' : lambda x, C, stride: DilConv(x, C, [5,5], stride,2),
-  # 'conv_7x1_1x7' : lambda x, C, stride: nn.Sequential(
-  #   nn.ReLU(inplace=False),
-  #   nn.Conv2d(C, C, (1,7), stride=(1, stride), padding=(0, 3), bias=False),
-  #   nn.Conv2d(C, C, (7,1), stride=(stride, 1), padding=(3, 0), bias=False),
-  #   nn.BatchNorm2d(C, affine=affine)
-  #   ),
+    'none': lambda C: Zero(C),
+    'skip_connect': lambda C: Identity(),
+    'batch_norm': lambda C: tf.keras.layers.BatchNormalization(),
+    'dropout': lambda C: tf.keras.layers.Dropout(rate=0.1),
+    'dense': lambda C: tf.keras.layers.Dense(C, activation='relu', name='mydense')
 }
-def Zero(x,stride):
-	return tf.zeros_like(x)[:,::stride[0],::stride[1],:]
 
-def DilConv(x,C_out,kernel_size,stride,rate):
-	x=nn.relu(x)
-	x=slim.separable_convolution2d(x,C_out,kernel_size,depth_multiplier=1,stride=stride,rate=rate)
-	x=slim.batch_norm(x)
-	return x
-def SepConv(x,C_out,kernel_size,stride):
-	x=nn.relu(x)
-	C_in=x.get_shape()[-1]
 
-	x=slim.separable_convolution2d(x,C_in,kernel_size,depth_multiplier=1,stride=stride)
-	x=slim.batch_norm(x)
+class Identity(tf.keras.layers.Layer):
+    def __init__(self):
+        super(Identity, self).__init__()
 
-	x=slim.separable_convolution2d(x,C_out,kernel_size,depth_multiplier=1)
-	x=slim.batch_norm(x)
-	return x
+    def call(self, x):
+        return x
 
-def FactorizedReduce(x,c_out):
-	x=nn.relu(x)
-	conv1=slim.conv2d(x,c_out//2,[1,1],stride=[2,2])
-	conv2=slim.conv2d(x[:,1:,1:,:],c_out//2,[1,1],stride=[2,2])
-	x=tf.concat([conv1,conv2],-1)
-	x=slim.batch_norm(x)
-	return x
-def ReLUConvBN(x,C_out):
-	x=nn.relu(x)
-	x=slim.conv2d(x,C_out,[1,1])
-	x=slim.batch_norm(x)
-	return x
+
+class Zero(tf.keras.layers.Layer):
+    def __init__(self, C_out):
+        super(Zero, self).__init__()
+        self.C_out = C_out
+
+    def call(self, x):
+        return tf.zeros_like(x)[:, :self.C_out]
+
+
+class DenseBN(tf.keras.layers.Layer):
+    def __init__(self, C_out, activation=None):
+        super(DenseBN, self).__init__()
+        self.activation = activation
+        self.C_out = C_out
+        self.BN = None
+        self.dense = None
+
+    def build(self, input_shape):
+        self.dense = tf.keras.layers.Dense(self.C_out, self.activation, name='DenseBN')
+        self.BN = tf.keras.layers.BatchNormalization()
+
+    def call(self, x, training):
+        x = self.dense(x)
+        x = self.BN(x, training=training)
+        return x
+
+# def DilConv(x, C_out, kernel_size, stride, rate):
+#     x = nn.relu(x)
+#     x = slim.separable_convolution2d(x, C_out, kernel_size, depth_multiplier=1, stride=stride, rate=rate)
+#     x = slim.batch_norm(x)
+#     return x
+#
+#
+# def SepConv(x, C_out, kernel_size, stride):
+#     x = nn.relu(x)
+#     C_in = x.get_shape()[-1]
+#
+#     x = slim.separable_convolution2d(x, C_in, kernel_size, depth_multiplier=1, stride=stride)
+#     x = slim.batch_norm(x)
+#
+#     x = slim.separable_convolution2d(x, C_out, kernel_size, depth_multiplier=1)
+#     x = slim.batch_norm(x)
+#     return x
+#
+#
+# def FactorizedReduce(x, c_out):
+#     x = nn.relu(x)
+#     conv1 = slim.conv2d(x, c_out // 2, [1, 1], stride=[2, 2])
+#     conv2 = slim.conv2d(x[:, 1:, 1:, :], c_out // 2, [1, 1], stride=[2, 2])
+#     x = tf.concat([conv1, conv2], -1)
+#     x = slim.batch_norm(x)
+#     return x
+#
+#
+# def ReLUConvBN(x, C_out):
+#     x = nn.relu(x)
+#     x = slim.conv2d(x, C_out, [1, 1])
+#     x = slim.batch_norm(x)
+#     return x

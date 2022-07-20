@@ -3,6 +3,8 @@ import sys
 
 import numpy as np
 import tensorflow as tf
+from mapping_network_utils import ActivationsExtractor
+
 from genotypes import PRIMITIVES
 from genotypes import Genotype
 from operations import *
@@ -11,89 +13,187 @@ import utils
 null_scope = tf.compat.v1.VariableScope("")
 
 
-def MixedOp(x, C_out, stride, index, reduction):
-    ops = []
+class MixedOp(tf.keras.layers.Layer):
+    def __init__(self, C_out, arch_weight, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ops = None
+        self.C_out = C_out
+        self.arch_weight = arch_weight
 
-    # TODO [INFO] get_variable accesses a global variable storage where it looks for the variable with these params,
-    # TODO [INFO] otherwise it creates a new one. This way, this method can be called multiple times and it will act
-    # TODO [INFO] as a persistent object
+    def build(self, input_shape):
+        self.ops = []
+        for primitive in PRIMITIVES:
+            self.ops.append(OPS[primitive](self.C_out))
 
+    def call(self, inputs, training, *args, **kwargs):
+        # TODO [INFO] get_variable accesses a global variable storage where it looks for the variable with these params,
+        # TODO [INFO] otherwise it creates a new one. This way, this method can be called multiple times and it will act
+        # TODO [INFO] as a persistent object
 
+        weight = nn.softmax(self.arch_weight)
+        weight = tf.reshape(weight, [-1, 1])
 
-    with tf.compat.v1.variable_scope(null_scope):
-        with tf.compat.v1.variable_scope("arch_var", reuse=tf.compat.v1.AUTO_REUSE):
-            weight = tf.compat.v1.get_variable("weight{}_{}".format(2 if reduction else 1, index), [len(PRIMITIVES)],
-                                     initializer=tf.compat.v1.random_normal_initializer(0, 1e-3),
-                                     regularizer=tf.keras.regularizers.l2(0.5 * (0.0001)))
-    weight = tf.nn.softmax(weight)
-    weight = tf.reshape(weight, [-1, 1, 1, 1])
-    index = 0
-    for primitive in PRIMITIVES:
+        outs = []
 
-        op = OPS[primitive](x, C_out, stride)
-        if 'pool' in primitive:
-            op = slim.batch_norm(op)
+        for index, op in enumerate(self.ops):
+            if PRIMITIVES[index] == 'batch_norm':
+                out = op(inputs, training=training)
+            else:
+                out = op(inputs)
+            mask = [i == index for i in range(len(PRIMITIVES))]  # TODO [INFO] getting the arch weight for current op
+            w_mask = tf.constant(mask, tf.bool)
+            w = tf.boolean_mask(tensor=weight, mask=w_mask)
+            outs.append(out * w)  # TODO [INFO] getting the op feature map weighed by the arch weights
 
-        mask = [i == index for i in range(len(PRIMITIVES))] # TODO [INFO] getting the arch weight for current op
-        w_mask = tf.constant(mask, tf.bool)
-        w = tf.boolean_mask(tensor=weight, mask=w_mask)
-        ops.append(op * w) # TODO [INFO] getting the op feature map weighed by the arch weigts
-        index += 1
-    return tf.add_n(ops)  # TODO [INFO] returning the sum of all partial feature maps
-
-# TODO [INFO] This
-
-def Cell(s0, s1, cells_num, multiplier, C_out, reduction, reduction_prev):
-    print('im a cell :)')
-
-    if reduction_prev:
-        s0 = FactorizedReduce(s0, C_out) # TODO [Info] s0 and s1 represent the nodes in the DARTS graph
-    else:
-        s0 = ReLUConvBN(s0, C_out)
-    s1 = ReLUConvBN(s1, C_out)
-
-    state = [s0, s1]  # TODO [info]  state = [CELL(K-2), CELL(K-1), Node 0, Node 1, Node 2, Node 3 ]
-    offset = 0       # TODO [!! info]  ALL NODE IN THE GRAPH ARE A SUM MIXED OPS FROM ALL PREVIOUS NODES (INC S0 AND S1)
-    for i in range(cells_num):
-        temp = []
-        for j in range(2 + i):
-            stride = [2, 2] if reduction and j < 2 else [1, 1]
-            temp.append(MixedOp(state[j], C_out, stride, offset + j, reduction))    # TODO [info] offset+j simply ensure each MixedOp gets an increasing id (0-13)
-                                                                                    # TODO [info] there are 14 mixed ops, 2 for node 0, 3 for node 1, 4 for node 2 and 5 for node 3
-
-        offset += len(state)
-        state.append(tf.add_n(temp))
-
-    out = tf.concat(state[-multiplier:], axis=-1) # TODO [INFO] Output of cell is concatenation of Nodes 0-3
-    return out
+        return tf.add_n(outs)  # TODO [INFO] returning the sum of all partial feature maps
 
 
+class Cell(tf.keras.layers.Layer):
+    def __init__(self, cells_num, multiplier, C_out, arch_weights, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.prep0 = None
+        self.prep1 = None
+        self.arch_weights = arch_weights
+        self.mixed_ops = None
+        self.cells_num = cells_num
+        self.multiplier = multiplier
+        self.C_out = C_out
 
-def Model(x, y, is_training, first_C, class_num, layer_num, cells_num=4, multiplier=4, stem_multiplier=3, name="model"):
-    with tf.compat.v1.variable_scope(name, reuse=tf.compat.v1.AUTO_REUSE):
-        with slim.arg_scope([slim.conv2d, slim.separable_conv2d], activation_fn=None, padding='SAME',
-                            biases_initializer=None, weights_regularizer=tf.keras.regularizers.l2(0.5 * (0.0001))):
-            with slim.arg_scope([slim.batch_norm], is_training=is_training):
-                C_curr = stem_multiplier * first_C
-                s0 = slim.conv2d(x, C_curr, [3, 3], activation_fn=nn.relu)
-                s0 = slim.batch_norm(s0)
-                s1 = slim.conv2d(x, C_curr, [3, 3], activation_fn=nn.relu)
-                s1 = slim.batch_norm(s1)
-                reduction_prev = False
-                for i in range(layer_num):
-                    if i in [layer_num // 3, 2 * layer_num // 3]:
-                        C_curr *= 2
-                        reduction = True
-                    else:
-                        reduction = False
-                    s0, s1 = s1, Cell(s0, s1, cells_num, multiplier, C_curr, reduction, reduction_prev) # TODO [INFO] S1 is the feature maps of the previous cell, and S0 of the one before
-                    reduction_prev = reduction
-                out = tf.reduce_mean(input_tensor=s1, axis=[1, 2], keepdims=True, name='global_pool')
-                logits = slim.conv2d(out, class_num, [1, 1], activation_fn=None, normalizer_fn=None,
-                                     weights_regularizer=tf.keras.regularizers.l2(0.5 * (0.0001)))
-                logits = tf.squeeze(logits, [1, 2], name='SpatialSqueeze')
-    train_loss = tf.reduce_mean(input_tensor=tf.nn.sparse_softmax_cross_entropy_with_logits(labels=y, logits=logits))
-    return logits, train_loss
+    def build(self, input_shape):
+        self.mixed_ops = []
+        for i in range(tf.add_n(range(2, self.cells_num + 2)).numpy()):
+            self.mixed_ops.append(MixedOp(self.C_out, self.arch_weights[i]))
+
+        self.prep0 = DenseBN(self.C_out, activation='relu')
+        self.prep1 = DenseBN(self.C_out, activation='relu')
+
+    def call(self, inputs, training=False, *args, **kwargs):
+        if not isinstance(inputs, list) or len(inputs) != 2:
+            raise Exception('Input to Cell Layer must be a list with two items')
+
+        s0, s1 = inputs[0], inputs[1]
+        s0 = self.prep0(s0, training=training)
+        s1 = self.prep1(s1, training=training)
+
+        state = [s0, s1]  # state = [CELL(K-2), CELL(K-1), Node 0, Node 1, Node 2, Node 3 ]
+        ix = 0
+        for i in range(self.cells_num):
+            temp = []
+            for j in range(2 + i):
+                temp.append(self.mixed_ops[ix](state[j], training=training))
+                ix += 1
+
+            state.append(tf.add_n(temp))
+        out = tf.concat(state[-self.multiplier:], axis=-1)  # Output of cell is concatenation of Nodes 0-3
+        return out
+
+
+class Model(tf.keras.Model):
+
+    def __init__(self, loss_fn, first_C, class_num, layer_num, cells_num=4, multiplier=4, *args,
+                 **kwargs):
+        super().__init__()
+        self.loss_fn = loss_fn
+        self.first_C = first_C
+        self.multiplier = multiplier
+        self.cells_num = cells_num
+        self.layer_num = layer_num
+        self.class_num = class_num
+        self.dense = None
+        self.arch_weights = None
+        self.s0_pre_proc = None
+        self.cells = None
+        self.s1_pre_proc = None
+        self.prep1 = None
+        self.prep0 = None
+        self.model_weights = None
+
+    def build(self, input_shape):
+        # number of mixed_ops in cell 2+3+4+5 ... cells_num times
+        self.arch_weights = [None] * tf.add_n(range(2, self.cells_num + 2)).numpy()
+        for i, _ in enumerate(self.arch_weights):
+            self.arch_weights[i] = self.add_weight("arch_weight_{}".format(i), [len(PRIMITIVES)],
+                                                   initializer=tf.compat.v1.random_normal_initializer(0, 1e-3),
+                                                   trainable=True)
+        C_curr = self.first_C
+
+        self.cells = []
+        for i in range(self.layer_num):
+            if C_curr > 16:
+                C_curr = C_curr // 2
+            cell = Cell(self.cells_num, self.multiplier, C_curr, self.arch_weights)
+            self.cells.append(cell)
+
+        self.prep0 = DenseBN(self.first_C)
+        self.prep1 = DenseBN(self.first_C)
+        self.dense = tf.keras.layers.Dense(self.class_num, input_shape = input_shape, activation='sigmoid' if self.class_num == 1 else 'softmax')
+
+    def call(self, inputs, training=False, mask=None):
+        x = inputs
+        s0 = self.prep0(x)
+        s1 = self.prep1(x)
+        for i in range(self.layer_num):
+            s0, s1 = s1, self.cells[i]([s0, s1])
+        logits = self.dense(inputs)
+        return logits
+
+    def get_arch_weights(self):
+        return self.arch_weights
+
+    def get_model_weights(self):
+        if self.model_weights is None:
+            model_weights = [w for w in self.trainable_weights if (not w.name.__contains__('arch'))]
+            self.model_weights = model_weights
+        return self.model_weights
+
+    def get_genotype(self):
+        # todo [info] -> for each node in the search space, returns the two incoming mixed-ops which have the most confidence in their choice of op
+        def _parse():
+            offset = 0
+            genotype = []
+            arch_var = self.arch_weights
+            for i in range(self.cells_num):
+                edges = []
+                edges_confident = []
+                for j in range(i + 2):
+                    weight = arch_var[offset + j]
+                    value = weight.numpy()
+                    value_sorted = value.argsort()
+                    max_index = value_sorted[-2] if value_sorted[-1] == PRIMITIVES.index('none') else value_sorted[-1]
+
+                    edges.append((PRIMITIVES[max_index], j))
+                    edges_confident.append(value[max_index])
+                edges_confident = np.array(edges_confident)
+                max_edges = [edges[np.argsort(edges_confident)[-1]], edges[np.argsort(edges_confident)[-2]]]
+                genotype.extend(max_edges)
+                offset += i + 2
+            return genotype
+
+        concat = list(range(2 + self.cells_num - self.multiplier, self.cells_num + 2))
+        gene_normal = _parse()
+        genotype = Genotype(
+            normal=gene_normal, normal_concat=concat,
+        )
+        return genotype
+
+    def deep_clone(self, init):
+        clone = Model(self.loss_fn, self.first_C, self.class_num, self.layer_num, self.cells_num, self.multiplier)
+        clone(init, training=True)  # builds model
+        for v_, v in zip(clone.get_model_weights(), self.get_model_weights()):
+            v_.assign(v)
+        return clone
+
+    def compute_loss(self, x, y, weight_decay=1e-3, return_logits=False):
+        logits = self(x, training=True)
+        loss = self.loss_fn(y, logits)
+        reg = l2(0.0001)
+        reg_loss = [reg(v) for v in self.trainable_weights]
+        reg_loss = tf.reduce_mean(reg_loss)
+        loss += 1e4 * weight_decay * reg_loss
+        if return_logits:
+            return logits, loss
+        else:
+            return loss
 
 
 def Model_test(x, y, is_training, name="weight_var"):
@@ -114,38 +214,3 @@ def Model_test(x, y, is_training, name="weight_var"):
     train_loss = tf.reduce_mean(input_tensor=tf.nn.sparse_softmax_cross_entropy_with_logits(labels=y, logits=logits))
 
     return logits, train_loss
-
-
-def get_genotype(sess, cells_num=4, multiplier=4):
-    def _parse(stride, sess):
-        offset = 0
-        genotype = []
-        arch_var_name, arch_var = utils.get_var(tf.compat.v1.trainable_variables(), 'arch_var')
-        print(arch_var)
-        for i in range(cells_num):
-            edges = []
-            edges_confident = []
-            for j in range(i + 2):
-                with tf.compat.v1.variable_scope("", reuse=tf.compat.v1.AUTO_REUSE):
-                    weight = arch_var[arch_var_name.index("arch_var/weight{}_{}:0".format(stride, offset + j))]
-                    value = sess.run(weight)
-                value_sorted = value.argsort()
-                max_index = value_sorted[-2] if value_sorted[-1] == PRIMITIVES.index('none') else value_sorted[-1]
-
-                edges.append((PRIMITIVES[max_index], j))
-                edges_confident.append(value[max_index])
-
-            edges_confident = np.array(edges_confident)
-            max_edges = [edges[np.argsort(edges_confident)[-1]], edges[np.argsort(edges_confident)[-2]]]
-            genotype.extend(max_edges)
-            offset += i + 2
-        return genotype
-
-    concat = list(range(2 + cells_num - multiplier, cells_num + 2))
-    gene_normal = _parse(1, sess)
-    gene_reduce = _parse(2, sess)
-    genotype = Genotype(
-        normal=gene_normal, normal_concat=concat,
-        reduce=gene_reduce, reduce_concat=concat
-    )
-    return genotype
