@@ -3,7 +3,6 @@ import sys
 
 import numpy as np
 import tensorflow as tf
-from mapping_network_utils import ActivationsExtractor
 
 from genotypes import PRIMITIVES
 from genotypes import Genotype
@@ -90,18 +89,24 @@ class Cell(tf.keras.layers.Layer):
 
 class Model(tf.keras.Model):
 
-    def __init__(self, loss_fn, first_C, class_num, layer_num, cells_num=4, multiplier=4, *args,
+    def __init__(self, arch_opt, lr, first_C, class_num, layer_num,
+                 cells_num=4,
+                 multiplier=4,
+                 original=True,
+                 *args,
                  **kwargs):
         super().__init__()
-        self.loss_fn = loss_fn
+        self.original = original
+        self.clone = None
+        self.lr = lr
         self.first_C = first_C
         self.multiplier = multiplier
         self.cells_num = cells_num
         self.layer_num = layer_num
         self.class_num = class_num
-        self.dense = None
+        self.arch_opt = arch_opt
+        self.output_layer = None
         self.arch_weights = None
-        self.s0_pre_proc = None
         self.cells = None
         self.s1_pre_proc = None
         self.prep1 = None
@@ -109,6 +114,7 @@ class Model(tf.keras.Model):
         self.model_weights = None
 
     def build(self, input_shape):
+
         # number of mixed_ops in cell 2+3+4+5 ... cells_num times
         self.arch_weights = [None] * tf.add_n(range(2, self.cells_num + 2)).numpy()
         for i, _ in enumerate(self.arch_weights):
@@ -126,16 +132,109 @@ class Model(tf.keras.Model):
 
         self.prep0 = DenseBN(self.first_C)
         self.prep1 = DenseBN(self.first_C)
-        self.dense = tf.keras.layers.Dense(self.class_num, input_shape = input_shape, activation='sigmoid' if self.class_num == 1 else 'softmax')
+        self.output_layer = tf.keras.layers.Dense(self.class_num,
+                                                  activation='sigmoid' if self.class_num == 1 else 'softmax')
+
+    def update(self, clone):
+        for v_, v in zip(clone.trainable_weights, self.trainable_weights):
+            v_.assign(v)
 
     def call(self, inputs, training=False, mask=None):
-        x = inputs
-        s0 = self.prep0(x)
-        s1 = self.prep1(x)
+        s0 = self.prep0(inputs)
+        s1 = self.prep1(inputs)
         for i in range(self.layer_num):
             s0, s1 = s1, self.cells[i]([s0, s1])
-        logits = self.dense(inputs)
-        return logits
+        return self.output_layer(s1)
+
+    def compile(self,
+                optimizer='rmsprop',
+                loss=None,
+                metrics=None,
+                loss_weights=None,
+                weighted_metrics=None,
+                run_eagerly=None,
+                steps_per_execution=None,
+                **kwargs):
+        super(Model, self).compile(optimizer, loss, metrics, loss_weights, weighted_metrics, run_eagerly,
+                                   steps_per_execution, **kwargs)
+
+    def get_clone(self, init):
+        if not self.original:
+            raise Exception('Non-original models cant have clones')
+        if self.clone is None:
+            self.clone = self.deep_clone(init)
+        return self.clone
+
+    def train_step(self, data):
+        batch, labels = data
+        cut = int(batch.shape[0] * 0.8)
+        x = batch[:cut]
+        x_v = batch[cut:]
+        y = labels[:cut]
+        y_v = labels[cut:]
+
+        # GET TRAIN LOSS + GRADS
+        with tf.GradientTape() as tape:
+            logits = self(x)
+            train_loss = self.compiled_loss(y, logits)
+
+        train_grads = tape.gradient(train_loss, self.get_model_weights())
+
+        # ARCH STEP
+
+        clone = self.get_clone(x)
+        self.update(clone)
+
+        # w' =  w − ξ ∇w( L_train(w, α) )
+        self.optimizer.apply_gradients(zip(train_grads, clone.get_model_weights()))
+
+        with tf.GradientTape() as tape:
+            val_logits = clone(x_v)
+            val_loss = self.compiled_loss(y_v, val_logits)
+
+        valid_grads = tape.gradient(val_loss, clone.get_model_weights())  # ∇w'( L_val(w', α) )
+
+        with tf.GradientTape() as tape:
+            clone_val_logits = clone(x_v)
+            clone_val_loss = self.compiled_loss(y_v, clone_val_logits)
+
+        arch_grads = tape.gradient(clone_val_loss, clone.get_arch_weights())  # ∇α( L_val(w', α))
+
+        e = 1e-2
+        E = e / tf.linalg.global_norm(valid_grads)
+        opt_pos = tf.keras.optimizers.SGD(E)
+        opt_neg = tf.keras.optimizers.SGD(-2*E)
+
+        opt_pos.apply_gradients(zip(valid_grads, clone.get_model_weights()))  # W+ stored in clone
+        with tf.GradientTape() as tape:
+            pos_train_logits = clone(x)
+            pos_train_loss = self.compiled_loss(y, pos_train_logits)
+
+        train_grads_pos = tape.gradient(pos_train_loss, clone.get_arch_weights())  # ∇α L_train(w+, α)
+
+        opt_neg.apply_gradients(zip(valid_grads, clone.get_model_weights()))  # W- stored in clone_neg
+        with tf.GradientTape() as tape:
+            neg_train_logits = clone(x)
+            neg_train_loss = self.compiled_loss(y, neg_train_logits)
+
+        train_grads_neg = tape.gradient(neg_train_loss, clone.get_arch_weights())  # ∇α L_train(w-, α)
+
+        for ix, grad in enumerate(arch_grads):  # ~~ ∇α( L_val(w*, α) ), w* being fully trained model weights
+            arch_grads[ix] = arch_grads[ix] - self.lr * tf.divide(
+                train_grads_pos[ix] - train_grads_neg[ix], 2 * E)
+
+        self.arch_opt.apply_gradients(zip(arch_grads, self.arch_weights))  # <-- updating main models arch weights
+
+        # MODEL STEP
+        with tf.GradientTape() as tape:
+            logits = self(x)
+            train_loss = self.compiled_loss(y, logits)
+
+        train_grads = tape.gradient(train_loss, self.get_model_weights())
+        self.compiled_metrics.update_state(y, logits)
+        self.optimizer.apply_gradients(zip(train_grads, self.get_model_weights()))  # <-- updating main models model weights
+
+        return {m.name: m.result() for m in self.metrics}
 
     def get_arch_weights(self):
         return self.arch_weights
@@ -177,23 +276,13 @@ class Model(tf.keras.Model):
         return genotype
 
     def deep_clone(self, init):
-        clone = Model(self.loss_fn, self.first_C, self.class_num, self.layer_num, self.cells_num, self.multiplier)
-        clone(init, training=True)  # builds model
-        for v_, v in zip(clone.get_model_weights(), self.get_model_weights()):
-            v_.assign(v)
-        return clone
+        clone = Model(self.arch_opt, self.lr, self.first_C, self.class_num, self.layer_num, self.cells_num,
+                      self.multiplier, original=False)
+        clone.compile(self.optimizer, self.loss, self.metrics_names)
+        clone(init)
 
-    def compute_loss(self, x, y, weight_decay=1e-3, return_logits=False):
-        logits = self(x, training=True)
-        loss = self.loss_fn(y, logits)
-        reg = l2(0.0001)
-        reg_loss = [reg(v) for v in self.trainable_weights]
-        reg_loss = tf.reduce_mean(reg_loss)
-        loss += 1e4 * weight_decay * reg_loss
-        if return_logits:
-            return logits, loss
-        else:
-            return loss
+        self.update(clone)
+        return clone
 
 
 def Model_test(x, y, is_training, name="weight_var"):

@@ -27,6 +27,7 @@ SEC_LABELS = ['WarTrain']
 # De-comment to run on CPU
 # os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
+tf.config.run_functions_eagerly(True)
 
 def parse_args():
     parser = argparse.ArgumentParser("cifar")
@@ -87,9 +88,9 @@ def pad(a, div):
 
 def preprocess(x, y, batch_size):
     x, y = shuffle_together(x, y)
-    x = batch(x, batch_size)
-    y = batch(y, batch_size)
-    return tf.constant(np.stack(x), dtype='float32'), np.stack(y)
+    # x = batch(x, batch_size)
+    # y = batch(y, batch_size)
+    return np.stack(x), np.stack(y)
 
 
 def batch(a, batch_size):
@@ -110,22 +111,24 @@ def shuffle_together(a, b):
 
 
 def main():
+    if not tf.test.is_gpu_available():
+        raise Warning('Tensorflow not using GPU!')
+
     images, labels = load_dataset(args.dataset, args.data, val_split=1 - args.train_portion, test_split=0,
                                   sec_labels=True,
                                   filter_sec_labels=args.sec_labels)
 
-    x_train, y_train = preprocess(images['train'], labels['train'], args.batch_size)
-    x_val, y_val = preprocess(images['valid'], labels['valid'], args.batch_size)
+    extractor = ActivationsExtractor.load(args.extractor)  # load extractor
+    extract_vec = np.vectorize(extractor.extract_activations)
+
+    x_train = np.array([extractor.extract_activations(np.expand_dims(i, axis=0)) for i in images['train']])
+    x_val = np.array([extractor.extract_activations(np.expand_dims(i, axis=0)) for i in images['valid']])
+    y_train = labels['train']
+    y_val = labels['valid']
+
 
     model_loss = tf.metrics.binary_crossentropy
-    main_model = Model(model_loss, args.init_channels, CLASS_NUM, args.layers)
 
-    extractor = ActivationsExtractor.load(args.extractor)  # load extractor
-
-    init = extractor.extract_activations(x_train[0])
-    main_model(init)  # builds model
-    main_model.summary()
-    print(CLASS_NUM)
     lr = tf.keras.optimizers.schedules.CosineDecay(
         args.learning_rate,
         ((len(x_train) + len(x_val)) / args.batch_size) * args.epochs,
@@ -135,108 +138,23 @@ def main():
     arch_opt = tf.keras.optimizers.Adam(args.arch_learning_rate, 0.5, 0.999)
     model_opt = tf.keras.optimizers.SGD(learning_rate=lr, momentum=args.momentum)
 
-    if not tf.test.is_gpu_available():
-        raise Warning('Tensorflow not using GPU!')
+    main_model = Model(arch_opt,
+                       args.learning_rate,
+                       args.init_channels,
+                       CLASS_NUM,
+                       args.layers)
+
+    main_model.compile(loss='binary_crossentropy',
+                       optimizer='adam',
+                       metrics=['accuracy'])
+    main_model(np.expand_dims(x_train[0], axis=0))  # builds model
+    main_model.summary()
+
+    main_model.fit(x_train, y_train, epochs=args.epochs, batch_size=int((args.batch_size * 100) / 80),
+                   validation_data=zip(np.expand_dims(x_val, axis=0), np.expand_dims(y_val, axis=0)))
 
     genotype_record_file = open(output_dir + "genotype_record_file.txt", "w")
     gs = 0
-    for epoch in range(args.epochs):
-        print('start of an epoch')
-        objs = utils.AvgrageMeter()
-        top1 = utils.AvgrageMeter()
-        test_top1 = utils.AvgrageMeter()
-
-        for i in range(len(x_train)):
-            x, y = extractor.extract_activations(x_train[i]), y_train[i]
-            x_v, y_v = extractor.extract_activations(x_val[i % len(x_val)]), y_val[i % len(y_val)]
-
-            with tf.GradientTape(persistent=True) as tape:
-                # get train loss
-                # logits, train_loss = main_model.compute_loss(x, y, args.weight_decay, return_logits=True)
-                logits = main_model.call(x)
-                print('logits = {}'.format(logits))
-                print('label  = {}'.format(y))
-                train_loss = model_loss(y,logits)
-                print('train loss = {}'.format(train_loss))
-                with tape.stop_recording():
-                    watched = tape.watched_variables()
-                    train_grads = tape.gradient(train_loss, main_model.get_model_weights())
-
-                    # ARCH STEP
-                    clone = main_model.deep_clone(init)
-                    model_opt.apply_gradients(zip(train_grads, clone.get_model_weights()))  # w' =  w − ξ ∇w( L_train(w, α) )
-
-                    valid_loss = clone.compute_loss(x_v, y_v, args.weight_decay)
-
-            valid_grads = tape.gradient(valid_loss, clone.get_model_weights())  # ∇w'( L_val(w', α) )
-
-            e = 1e-2
-            E = e / tf.linalg.global_norm(valid_grads)
-            clone_pos = clone.deep_clone(init)
-            clone_neg = clone.deep_clone(init)
-            opt_pos = tf.keras.optimizers.SGD(E)
-            opt_pos.apply_gradients(zip(valid_grads, clone_pos.get_model_weights()))  # W+ stored in clone_pos
-            opt_neg = tf.keras.optimizers.SGD(-E)
-            opt_neg.apply_gradients(zip(valid_grads, clone_neg.get_model_weights()))  # W- stored in clone_neg
-
-            with tf.GradientTape(persistent=True) as tape:
-                pos_train_loss = clone_pos.compute_loss(x, y, args.weight_decay)
-                neg_train_loss = clone_neg.compute_loss(x, y, args.weight_decay)
-
-            train_grads_pos = tape.gradient(pos_train_loss, clone_pos.get_arch_weights())  # ∇α L_train(w+, α)
-            train_grads_neg = tape.gradient(neg_train_loss, clone_neg.get_arch_weights())  # ∇α L_train(w-, α)
-
-            with tf.GradientTape() as tape:
-                clone_val_loss = clone.compute_loss(x_v, y_v, args.weight_decay)
-
-            arch_grads = tape.gradient(clone_val_loss, clone.get_arch_weights())  # ∇α( L_val(w', α))
-
-            for ix, grad in enumerate(arch_grads):  # ~~ ∇α( L_val(w*, α) ), w* being fully trained model weights
-                arch_grads[ix] = arch_grads[ix] - args.learning_rate * tf.divide(
-                    train_grads_pos[ix] - train_grads_neg[ix], 2 * E)
-
-            arch_opt.apply_gradients(
-                zip(arch_grads, main_model.get_arch_weights()))  # <-- updating main models arch weights
-
-            # MODEL STEP
-            model_opt.apply_gradients(zip(train_grads, main_model.get_model_weights()))
-            acc = tf.reduce_mean(
-                input_tensor=tf.cast(tf.nn.in_top_k(predictions=logits, targets=np.asarray(y).flatten(), k=1),
-                                     tf.float32))
-
-            objs.update(np.mean(train_loss), args.batch_size)
-            top1.update(acc, args.batch_size)
-
-            if gs % args.report_freq == 0 or True:
-                print(
-                    "epochs {} steps {} currnt lr is {:.3f}  loss is {}  train_acc is {}".format(
-                        epoch, gs, lr(epoch), objs.avg, top1.avg
-                    )
-                )
-            gs += 1
-
-        print("-" * 80)
-        print("end of an epoch")
-
-        genotype = main_model.get_genotype()
-        print("genotype is {}".format(genotype))
-        genotype_record_file.write("{}".format(genotype) + "\n")
-
-        for i in range(len(x_val)):
-            x_v, y_v = extractor.extract_activations(x_val[i]), y_val[i]
-            logits = main_model(x_v)
-            valid_acc = tf.reduce_mean(
-                input_tensor=tf.cast(tf.nn.in_top_k(predictions=logits, targets=np.asarray(y_v).flatten(), k=1),
-                                     tf.float32))
-            test_top1.update(valid_acc, args.batch_size)
-
-        print(
-            "******************* epochs {}   valid_acc is {}".format(
-                epoch, test_top1.avg
-            )
-        )
-        print("-" * 80)
-        print("end of a valid epoch")
 
 
 if __name__ == "__main__":
