@@ -87,7 +87,7 @@ class Cell(tf.keras.layers.Layer):
         return out
 
 
-class Model(tf.keras.Model):
+class ContinuousModel(tf.keras.Model):
 
     def __init__(self, arch_opt, lr, first_C, class_num, layer_num,
                  cells_num=4,
@@ -132,8 +132,7 @@ class Model(tf.keras.Model):
 
         self.prep0 = DenseBN(self.first_C)
         self.prep1 = DenseBN(self.first_C)
-        self.output_layer = tf.keras.layers.Dense(self.class_num,
-                                                  activation='sigmoid' if self.class_num == 1 else 'softmax')
+        self.output_layer = tf.keras.layers.Dense(self.class_num)
 
     def update(self, clone):
         for v_, v in zip(clone.trainable_weights, self.trainable_weights):
@@ -146,18 +145,6 @@ class Model(tf.keras.Model):
             s0, s1 = s1, self.cells[i]([s0, s1])
         return self.output_layer(s1)
 
-    def compile(self,
-                optimizer='rmsprop',
-                loss=None,
-                metrics=None,
-                loss_weights=None,
-                weighted_metrics=None,
-                run_eagerly=None,
-                steps_per_execution=None,
-                **kwargs):
-        super(Model, self).compile(optimizer, loss, metrics, loss_weights, weighted_metrics, run_eagerly,
-                                   steps_per_execution, **kwargs)
-
     def get_clone(self, init):
         if not self.original:
             raise Exception('Non-original models cant have clones')
@@ -167,7 +154,7 @@ class Model(tf.keras.Model):
 
     def train_step(self, data):
         batch, labels = data
-        cut = int(batch.shape[0] * 0.8)
+        cut = int(batch.shape[0] * 0.5)
         x = batch[:cut]
         x_v = batch[cut:]
         y = labels[:cut]
@@ -212,7 +199,7 @@ class Model(tf.keras.Model):
 
         train_grads_pos = tape.gradient(pos_train_loss, clone.get_arch_weights())  # ∇α L_train(w+, α)
 
-        opt_neg.apply_gradients(zip(valid_grads, clone.get_model_weights()))  # W- stored in clone_neg
+        opt_neg.apply_gradients(zip(valid_grads, clone.get_model_weights()))  # W- stored in clone
         with tf.GradientTape() as tape:
             neg_train_logits = clone(x)
             neg_train_loss = self.compiled_loss(y, neg_train_logits)
@@ -269,15 +256,13 @@ class Model(tf.keras.Model):
             return genotype
 
         concat = list(range(2 + self.cells_num - self.multiplier, self.cells_num + 2))
-        gene_normal = _parse()
-        genotype = Genotype(
-            normal=gene_normal, normal_concat=concat,
-        )
+        gene = _parse()
+        genotype = Genotype(cell=gene, concat=concat)
         return genotype
 
     def deep_clone(self, init):
-        clone = Model(self.arch_opt, self.lr, self.first_C, self.class_num, self.layer_num, self.cells_num,
-                      self.multiplier, original=False)
+        clone = ContinuousModel(self.arch_opt, self.lr, self.first_C, self.class_num, self.layer_num, self.cells_num,
+                                self.multiplier, original=False)
         clone.compile(self.optimizer, self.loss, self.metrics_names)
         clone(init)
 
@@ -285,21 +270,3 @@ class Model(tf.keras.Model):
         return clone
 
 
-def Model_test(x, y, is_training, name="weight_var"):
-    weight_decay = 3e-4
-    with tf.compat.v1.variable_scope(name, reuse=tf.compat.v1.AUTO_REUSE):
-        with slim.arg_scope([slim.conv2d, slim.separable_conv2d], activation_fn=None, padding='SAME',
-                            biases_initializer=None, weights_regularizer=tf.keras.regularizers.l2(0.5 * (0.0001))):
-            with slim.arg_scope([slim.batch_norm], is_training=is_training):
-                # x=slim.max_pool2d(x,[3,3],stride=2)
-                s0 = x
-                s1 = x
-                for i in range(1):
-                    s0, s1 = s1, Cell(s0, s1, 4, 4, 32, False, False)
-                out = tf.reduce_mean(input_tensor=s1, axis=[1, 2], keepdims=True, name='global_pool')
-                logits = slim.conv2d(out, 10, [1, 1], activation_fn=None, normalizer_fn=None,
-                                     weights_regularizer=tf.keras.regularizers.l2(0.5 * (0.0001)))
-                logits = tf.squeeze(logits, [1, 2], name='SpatialSqueeze')
-    train_loss = tf.reduce_mean(input_tensor=tf.nn.sparse_softmax_cross_entropy_with_logits(labels=y, logits=logits))
-
-    return logits, train_loss

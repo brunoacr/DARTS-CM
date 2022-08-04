@@ -1,76 +1,116 @@
 import os
 import sys
 
+import dill
 import numpy as np
 import tensorflow as tf
-import tf_slim as slim
+from collections import namedtuple
 
 from operations import *
-def Cell(s0,s1,genotype, C_out, reduction, reduction_prev):
-	if reduction:
-		op_names, indices = zip(*genotype.reduce)
-		concat = genotype.reduce_concat
-	else:
-		op_names, indices = zip(*genotype.normal)
-		concat = genotype.normal_concat
 
-	cells_num=len(op_names) // 2
-	multiplier = len(concat)
 
-	if reduction_prev:
-		s0 = FactorizedReduce(s0,C_out)
-	else:
-		s0 = ReLUConvBN(s0,C_out)
-	s1=ReLUConvBN(s1,C_out)
+class Cell(tf.keras.layers.Layer):
+    def __init__(self, genotype, cells_num, C_out, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cells_num = cells_num
+        self.ops = None
+        self.genotype = genotype
+        self.prep0 = None
+        self.prep1 = None
+        self.C_out = C_out
+        self.multiplier = len(genotype.concat)
 
-	state=[s0,s1]
-	offset=0
-	for i in range(cells_num):
-		temp=[]
-		for j in range(2):
-			stride = [2,2] if reduction and indices[2*i+j] < 2 else [1,1]
-			h = state[indices[2*i+j]]
-			temp.append(OPS[op_names[2*i+j]](h, C_out, stride))   
-			#did not impelement path drop
-		state.append(tf.add_n(temp))
-	out=tf.concat(state[-multiplier:],axis=-1)
-	return out
-def AuxiliaryHeadCIFAR(x,class_num):
-	x=nn.relu(x)
-	x=slim.avg_pool2d(x,[5,5], stride=3,padding='SAME')
-	x=slim.conv2d(x,128,[1,1])
-	x=slim.batch_norm(x)
-	x=nn.relu(x)
-	x=slim.conv2d(x,768,[2,2])
-	x=slim.batch_norm(x)
-	x=nn.relu(x)
-	x=slim.flatten(x)
-	x=slim.fully_connected(x,class_num, activation_fn=None)
-	return x
+    def build(self, input_shape):
+        op_names, _ = zip(*self.genotype.cell)
 
-def Model(x,y,is_training,first_C,class_num,layer_num,auxiliary,genotype,stem_multiplier=3):
-	with tf.compat.v1.variable_scope('lw',reuse=tf.compat.v1.AUTO_REUSE):
-		with slim.arg_scope([slim.conv2d,slim.separable_conv2d],activation_fn=None,padding='SAME',biases_initializer=None,weights_regularizer=tf.keras.regularizers.l2(0.5 * (0.0001))):
-			with slim.arg_scope([slim.batch_norm],is_training=is_training):
-				C_curr = stem_multiplier*first_C
-				s0 =slim.conv2d(x,C_curr,[3,3],activation_fn=nn.relu)
-				s0=slim.batch_norm(s0)
-				s1 =slim.conv2d(x,C_curr,[3,3],activation_fn=nn.relu)
-				s1=slim.batch_norm(s1)
-				reduction_prev = False
-				logits_aux=None
-				for i in range(layer_num):
-					if i in [layer_num//3, 2*layer_num//3]:
-						C_curr *= 2
-						reduction = True
-					else:
-						reduction = False
-					s0,s1 =s1,Cell(s0,s1,genotype, C_curr, reduction, reduction_prev)
-					reduction_prev = reduction
-					if auxiliary and i == 2*layer_num//3:
-						logits_aux=AuxiliaryHeadCIFAR(s1,class_num)
+        self.ops = []
+        for name in op_names:
+            self.ops.append(OPS[name](self.C_out))
 
-				out=tf.reduce_mean(input_tensor=s1, axis=[1, 2], keepdims=True, name='global_pool')
-				logits = slim.conv2d(out, class_num, [1, 1], activation_fn=None,normalizer_fn=None,weights_regularizer=tf.keras.regularizers.l2(0.5 * (0.0001)))
-				logits = tf.squeeze(logits, [1, 2], name='SpatialSqueeze')
-	return logits,logits_aux
+        self.prep0 = DenseBN(self.C_out, activation='relu')
+        self.prep1 = DenseBN(self.C_out, activation='relu')
+
+    def call(self, inputs, training=False, *args, **kwargs):
+        if not isinstance(inputs, list) or len(inputs) != 2:
+            raise Exception('Input to Cell Layer must be a list with two items')
+
+        s0, s1 = inputs[0], inputs[1]
+        s0 = self.prep0(s0, training=training)
+        s1 = self.prep1(s1, training=training)
+
+        _, indices = zip(*self.genotype.cell)
+        state = [s0, s1]  # state = [CELL(K-2), CELL(K-1), Node 0, Node 1, Node 2, Node 3 ]
+        ix = 0
+        for i in range(self.cells_num):
+            temp = []
+            for j in range(2):
+                h = state[indices[2 * i + j]]
+                temp.append(self.ops[ix](h, training=training))
+                ix += 1
+
+            state.append(tf.add_n(temp))
+        out = tf.concat(state[-self.multiplier:], axis=-1)  # Output of cell is concatenation of Nodes 0-3
+        return out
+
+
+class Model(tf.keras.Model):
+
+    def __init__(self, first_C, class_num, layer_num, genotype, cells_num=4, *args, **kwargs):
+        super().__init__()
+        self.genotype = genotype
+        self.first_C = first_C
+        self.cells_num = cells_num
+        self.layer_num = layer_num
+        self.class_num = class_num
+        self.output_layer = None
+        self.cells = None
+        self.s1_pre_proc = None
+        self.prep1 = None
+        self.prep0 = None
+        self.model_weights = None
+
+    def build(self, input_shape):
+
+        # number of mixed_ops in cell 2+3+4+5 ... cells_num times
+        C_curr = self.first_C
+
+        self.cells = []
+        for i in range(self.layer_num):
+            if C_curr > 16:
+                C_curr = C_curr // 2
+            cell = Cell(self.genotype, self.cells_num, C_curr)
+            self.cells.append(cell)
+
+        self.prep0 = DenseBN(self.first_C)
+        self.prep1 = DenseBN(self.first_C)
+        self.output_layer = tf.keras.layers.Dense(self.class_num)
+
+    def call(self, inputs, training=False, mask=None):
+        s0 = self.prep0(inputs)
+        s1 = self.prep1(inputs)
+        for i in range(self.layer_num):
+            s0, s1 = s1, self.cells[i]([s0, s1])
+        return self.output_layer(s1)
+
+    def save_model(self, path):
+        state = ModelState(genotype=self.genotype,
+                           first_C=self.first_C,
+                           cells_num=self.cells_num,
+                           layer_num=self.layer_num,
+                           class_num=self.class_num,
+                           optimizer=self.optimizer,
+                           loss=self.loss
+                           )
+        dill.dump(state, open(os.path.join(path, 'model_state.pk'), 'wb'))
+        self.save_weights(os.path.join(path, 'weights', 'weights.tf'))
+
+    @staticmethod
+    def load_model(path):
+        state = dill.load(open(os.path.join(path, 'model_state.pk'), 'rb'))
+        model = Model(state.first_C, state.class_num, state.layer_num, state.genotype, state.cells_num)
+        model.compile(optimizer=state.optimizer, loss=state.loss, metrics=['accuracy'])
+        model.load_weights(os.path.join(path, 'weights', 'weights.tf')).expect_partial()
+        return model
+
+
+ModelState = namedtuple('ModelState', 'first_C class_num layer_num genotype cells_num optimizer loss')

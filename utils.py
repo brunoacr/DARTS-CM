@@ -2,6 +2,46 @@ import os
 import numpy as np
 import shutil
 
+# <bruno>
+
+def pad(a, div):
+    if len(a) % div == 0:
+        return a
+    ix = range(len(a))
+    choices = np.random.choice(ix, size=div - (len(a) % div))
+    a.extend([a[c] for c in choices])
+    return a
+
+
+def preprocess(x, y, batch_size):
+    x, y = shuffle_together(x, y)
+    # x = batch(x, batch_size)
+    # y = batch(y, batch_size)
+    return np.stack(x), np.stack(y)
+
+
+def batch(a, batch_size):
+    a = pad(a, batch_size)
+    out = [a[0:batch_size]]
+    for i in range(batch_size, len(a), batch_size):
+        ap = a[i: i + batch_size]
+        out.append(ap)
+    return out
+
+
+def shuffle_together(a, b):
+    assert len(a) == len(b)
+    p = list(np.random.permutation(len(a)))
+    a = [a[i] for i in p]
+    b = [b[i] for i in p]
+    return a, b
+
+
+# </bruno>
+
+
+
+
 
 class AvgrageMeter(object):
     def __init__(self):

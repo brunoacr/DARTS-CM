@@ -1,6 +1,6 @@
 from collections import namedtuple
 
-Genotype = namedtuple('Genotype', 'normal normal_concat')
+Genotype = namedtuple('Genotype', 'cell concat')
 
 PRIMITIVES = [
     'none',
