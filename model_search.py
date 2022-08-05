@@ -154,11 +154,10 @@ class ContinuousModel(tf.keras.Model):
 
     def train_step(self, data):
         batch, labels = data
-        cut = int(batch.shape[0] * 0.5)
-        x = batch[:cut]
-        x_v = batch[cut:]
-        y = labels[:cut]
-        y_v = labels[cut:]
+        x = batch['train']
+        x_v = batch['valid']
+        y = labels['train']
+        y_v = labels['valid']
 
         # GET TRAIN LOSS + GRADS
         with tf.GradientTape() as tape:
@@ -245,7 +244,7 @@ class ContinuousModel(tf.keras.Model):
                     weight = arch_var[offset + j]
                     value = weight.numpy()
                     value_sorted = value.argsort()
-                    max_index = value_sorted[-2] if value_sorted[-1] == PRIMITIVES.index('none') else value_sorted[-1]
+                    max_index = value_sorted[-1]  # value_sorted[-2] if value_sorted[-1] == PRIMITIVES.index('none') else value_sorted[-1]
 
                     edges.append((PRIMITIVES[max_index], j))
                     edges_confident.append(value[max_index])

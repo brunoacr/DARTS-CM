@@ -71,9 +71,11 @@ def architecture_search():
     metrics_logger = callbacks.MetricsLogger(args.output_dir, name='Continuous')
     genotype_logger = callbacks.GenotypeLogger(args.output_dir, name='Continuous')
 
-    main_model.fit(x_train, y_train,
+    x = {'train': x_train, 'valid': x_val}
+    y = {'train': y_train, 'valid': y_val}
+    main_model.fit(x, y,
                    epochs=args.epochs,
-                   batch_size=int((args.batch_size * 100) / 50),
+                   batch_size=args.batch_size,
                    validation_data=(x_val, y_val),
                    callbacks=[es, metrics_logger, genotype_logger])
 
@@ -180,7 +182,7 @@ def main():
 
 DATA_PATH = './../../data/xtrains_dataset'
 DATASET = 'XTRAINS'
-VAL_PORTION = 0.1
+VAL_PORTION = 0.25
 TEST_PORTION = 0.5
 DATASET_SIZE = 2000
 EPOCHS = 100

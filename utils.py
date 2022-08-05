@@ -2,6 +2,7 @@ import os
 import numpy as np
 import shutil
 
+
 # <bruno>
 
 def pad(a, div):
@@ -40,9 +41,6 @@ def shuffle_together(a, b):
 # </bruno>
 
 
-
-
-
 class AvgrageMeter(object):
     def __init__(self):
         self.reset()
@@ -56,6 +54,7 @@ class AvgrageMeter(object):
         self.sum += val * n
         self.cnt += n
         self.avg = self.sum / self.cnt
+
 
 def accuracy(output, target, topk=(1,)):
     maxk = max(topk)
@@ -74,12 +73,12 @@ def accuracy(output, target, topk=(1,)):
 
 def count_parameters_in_MB(model):
     return (
-        np.sum(
-            np.prod(v.size())
-            for name, v in model.named_parameters()
-            if "auxiliary" not in name
-        )
-        / 1e6
+            np.sum(
+                np.prod(v.size())
+                for name, v in model.named_parameters()
+                if "auxiliary" not in name
+            )
+            / 1e6
     )
 
 

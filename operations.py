@@ -10,7 +10,8 @@ OPS = {
     'skip_connect': lambda C: Identity(),
     'batch_norm': lambda C: tf.keras.layers.BatchNormalization(),
     'dropout': lambda C: tf.keras.layers.Dropout(rate=0.1),
-    'dense': lambda C: tf.keras.layers.Dense(C, activation='relu', name='mydense')
+    'dense_relu': lambda C: tf.keras.layers.Dense(C, activation='relu'),
+    'dense': lambda C: tf.keras.layers.Dense(C)
 }
 
 
