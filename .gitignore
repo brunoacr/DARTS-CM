@@ -4,3 +4,6 @@ data
 outputs
 __pycache__
 extractors
+/scripts/
+
+libdevice.10.bc

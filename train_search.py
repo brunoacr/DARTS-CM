@@ -1,14 +1,25 @@
 import argparse
+import math
+
+# external
+from pathlib import Path
 
 import numpy as np
-
-from model_search import *
-from model import *
 from datetime import datetime
-from mapping_network_utils.activations_extractor import ActivationsExtractor
-from main_network.main_network_utils import load_dataset
+import os
 import tensorflow as tf
-import callbacks
+
+# internal
+from utils.activations_extractor import ActivationsExtractor
+from utils.data_utils import loadDataset, loadExtractor
+import visualize
+from utils import callbacks
+from model_search import ContinuousModel
+from model import Model
+import sys
+
+sys.path.append('G:\System Folders/University\Dissertação\Projects\MAPPING_UTILS\mapping_network_utils')
+
 
 # PARAMS
 
@@ -16,32 +27,27 @@ import callbacks
 # os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
 tf.config.run_functions_eagerly(True)
-tf.data.experimental.enable_debug_mode()
+# tf.data.experimental.enable_debug_mode()
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=str, default=DATA_PATH, help="location of the data corpus")
-    parser.add_argument("--batch_size", type=int, default=32, help="batch size")
-    parser.add_argument("--learning_rate", type=float, default=0.005, help="init learning rate")
-    parser.add_argument("--learning_rate_min", type=float, default=0.001, help="min learning rate")
+    parser.add_argument("--folder_name", type=str, default=FOLDER_NAME, help="desired name for output folder")
+    parser.add_argument("--complexity", type=int, default=COMPLEXITY, help="desired dataset complexity")
+    parser.add_argument("--main_network", type=str, default=MAIN_NETWORK,
+                        choices=['Residential', 'Commercial', 'Industrial'], help="main network to extract from")
+    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE, help="batch size")
+    parser.add_argument("--learning_rate", type=float, default=LR, help="init learning rate")
+    parser.add_argument("--learning_rate_min", type=float, default=MIN_LR, help="min learning rate")
     parser.add_argument("--epochs", type=int, default=EPOCHS, help="num of training epochs")
-    parser.add_argument("--init_channels", type=int, default=1024, help="num of init channels")
+    parser.add_argument("--init_neurons", type=int, default=INIT_NEURONS, help="num of init channels")
     parser.add_argument("--layers", type=int, default=LAYERS, help="total number of layers")
-    parser.add_argument("--cutout", action="store_true", default=False, help="use cutout")
-    parser.add_argument("--cutout_length", type=int, default=16, help="cutout length")
-    parser.add_argument("--drop_path_prob", type=float, default=0.3, help="drop path probability")
-    parser.add_argument("--grad_clip", type=float, default=5, help="gradient clipping")
-    parser.add_argument("--arch_learning_rate", type=float, default=3e-4, help="learning rate for arch encoding")
-    parser.add_argument("--arch_weight_decay", type=float, default=1e-3, help="weight decay for arch encoding")
+    parser.add_argument("--arch_learning_rate", type=float, default=ARCH_LR, help="learning rate for arch encoding")
+    parser.add_argument("--arch_weight_decay", type=float, default=ARCH_DECAY, help="weight decay for arch encoding")
     parser.add_argument("--val_portion", type=float, default=VAL_PORTION, help="portion of training data")
     parser.add_argument("--test_portion", type=float, default=TEST_PORTION, help="portion of training data")
-    parser.add_argument("--dataset_size", type=float, default=DATASET_SIZE, help="portion of training data")
-    parser.add_argument('--extractor_path', type=str, default=EXTRACTOR_PATH,
-                        help='location of the activations extractor')
-    parser.add_argument('--sec_labels', type=str, nargs='+', default=['WarTrain'],
-                        help='Secondary labels mapping model should learn')
-    parser.add_argument('--dataset', type=str, default=DATASET, choices=['VCAB', 'XTRAINS'])
+    parser.add_argument("--dataset_size", type=int, default=DATASET_SIZE, help="portion of training data")
+    parser.add_argument('--concept', type=str, default=CONCEPT, help='Concept to Map')
     return parser.parse_args()
 
 
@@ -55,75 +61,83 @@ def architecture_search():
     x_val, y_val = args.images['valid'], args.labels['valid']
 
     main_model = ContinuousModel(args.arch_opt,
-                                 args.lr.initial_learning_rate,
-                                 args.init_channels,
-                                 CLASS_NUM,
+                                 args.lr,
+                                 args.init_neurons,
+                                 1,
                                  args.layers)
 
     main_model.compile(loss=args.loss_fn,
                        optimizer=args.model_opt,
                        metrics=['accuracy'])
+
     main_model(np.expand_dims(x_train[0], axis=0))  # builds model
-    main_model.summary()
 
-    es = tf.keras.callbacks.EarlyStopping(patience=25, monitor='val_loss')
+    c_dir = Path(args.output_dir, 'Continous')
+    model_dir = Path(c_dir, 'model')
+    os.makedirs(model_dir)
 
-    metrics_logger = callbacks.MetricsLogger(args.output_dir, name='Continuous')
-    genotype_logger = callbacks.GenotypeLogger(args.output_dir, name='Continuous')
+    saver = callbacks.SaveBestModel(model_dir)
+    es = tf.keras.callbacks.EarlyStopping(patience=20, monitor='val_loss')
+    metrics_logger = callbacks.MetricsLogger(c_dir, name='Continuous')
+    genotype_logger = callbacks.GenotypeLogger(c_dir, name='Continuous')
 
     x = {'train': x_train, 'valid': x_val}
     y = {'train': y_train, 'valid': y_val}
     main_model.fit(x, y,
                    epochs=args.epochs,
-                   batch_size=args.batch_size,
+                   batch_size=args.batch_size * 2,
                    validation_data=(x_val, y_val),
-                   callbacks=[es, metrics_logger, genotype_logger])
+                   callbacks=[es, metrics_logger, genotype_logger, saver])
 
+    main_model = ContinuousModel.load_model(model_dir)
     return main_model.get_genotype()
 
 
-def train_discreet_model(genotype):
+def train_discrete_model(genotype, layer_num):
     images, labels, model_opt, lr = args.images, args.labels, args.model_opt, args.lr
     x_train, y_train, x_val, y_val, x_test, y_test = images['train'], labels['train'], images['valid'], labels['valid'], \
                                                      images['test'], labels['test']
 
-    model = Model(args.init_channels,
-                  CLASS_NUM,
-                  args.layers,
+    model = Model(int(math.pow(2, layer_num) * args.init_neurons),
+                  1,
+                  layer_num,
                   genotype)
 
     model.compile(loss=args.loss_fn,
                   optimizer=model_opt,
                   metrics=['accuracy'])
 
-    es = tf.keras.callbacks.EarlyStopping(patience=15, monitor='val_loss', restore_best_weights=True)
-    logger = callbacks.MetricsLogger(args.output_dir, name='Discreet')
+    d_dir = os.path.join(args.output_dir, 'Discrete_{}Layers'.format(layer_num))
+    model_dir = os.path.join(d_dir, 'model')
+    os.makedirs(model_dir)
+
+    es = tf.keras.callbacks.EarlyStopping(patience=15, monitor='val_loss')
+    logger = callbacks.MetricsLogger(d_dir, name='Discrete_' + str(layer_num) + '_')
+    saver = callbacks.SaveBestModel(model_dir)
 
     model.fit(x_train, y_train,
               epochs=args.epochs,
               batch_size=args.batch_size,
               validation_data=(x_val, y_val),
-              callbacks=[es, logger])
+              callbacks=[es, logger, saver])
+
+    model = Model.load_model(model_dir)
 
     metrics = model.evaluate(x_test, y_test, return_dict=True)
     print('Trained Model Test Metrics: {}'.format(str(metrics)))
-    save_model(model, metrics)
 
-
-def save_model(model, metrics):
-    model_dir = os.path.join(args.output_dir, 'trained_model')
-    if not os.path.isdir(model_dir):
-        os.makedirs(model_dir)
     file = open(os.path.join(model_dir, 'eval.txt'), 'w')
     file.write(str(metrics))
     file.close()
-    model.save_model(model_dir)
 
 
 def prepare():
+
     #  -------  OUTPUT DIR  -------
-    args.output_dir = os.path.join('./outputs', args.dataset, args.extractor_path.split('/')[-1], str(args.sec_labels),
-                                   str(args.layers) + '_Layers_' + TIMESTAMP)
+
+    args.output_dir = Path('./outputs', args.folder_name, 'C' + str(args.complexity) + '_' + str(args.main_network),
+                           args.concept,
+                           TIMESTAMP)
 
     if not os.path.isdir(args.output_dir):
         print("Creating output dir: {}".format(args.output_dir))
@@ -136,15 +150,17 @@ def prepare():
 
     #  -------   LOAD DATA  -------
 
-    args.images, args.labels = load_dataset(args.dataset, args.data, size=args.dataset_size, val_split=args.val_portion,
-                                            test_split=args.test_portion,
-                                            sec_labels=True,
-                                            filter_sec_labels=args.sec_labels)
+    args.images, args.labels = loadDataset(args.complexity,
+                                           balance_class=args.concept,
+                                           size=args.dataset_size,
+                                           val_split=args.val_portion,
+                                           test_split=args.test_portion,
+                                           padding=True
+                                           )
 
-    print('Train size: {} Val Size: {} Test Size: {}'.format(len(args.images['train']), len(args.images['valid']),
-                                                             len(args.images['test'])))
     #  -------   EXTRACTOR  -------
-    args.extractor = ActivationsExtractor.load(args.extractor_path)  # load extractor
+
+    args.extractor = loadExtractor(args.complexity, args.main_network)
     convert_to_activations(args.images)
 
     #  -------   LEARNING RATE SCHEDULER  -------
@@ -157,41 +173,51 @@ def prepare():
 
     #  -------   OPTIMIZERS  -------
     # args.model_opt = tf.keras.optimizers.SGD(learning_rate=0.001, momentum=args.momentum)
-    args.model_opt = tf.keras.optimizers.Adam(args.lr)
+    args.model_opt = tf.keras.optimizers.Adam()
 
     args.arch_opt = tf.keras.optimizers.Adam(args.arch_learning_rate, 0.5, 0.999)
 
     #  -------   LOSS FUNCTION  -------
 
-    args.loss_fn = tf.keras.losses.BinaryCrossentropy(
-        from_logits=True) if CLASS_NUM == 1 else tf.keras.losses.CategoricalCrossentropy(from_logits=True)
+    args.loss_fn = tf.keras.losses.BinaryCrossentropy(from_logits=True)
 
 
 def main():
     if not tf.test.is_gpu_available():
-        raise Warning('Tensorflow not using GPU!')
+        args.logger.warning('Tensorflow not using GPU')
 
     prepare()
     print('Starting Architecture Search')
     genotype = architecture_search()
-    print('Architecture Search Finished \n Genotype: {} \n Starting Discreet Model Training'.format(genotype))
-    train_discreet_model(genotype)
-    print(
-        'Finished Discreet Model Training \n Logs and trained model saved at {}'.format(args.output_dir))
+    visualize.plot(genotype.cell, os.path.join(args.output_dir, 'genotype'))
+
+    print('Architecture Search Finished \n Genotype: {}'.format(
+        genotype))
+    for layer_num in range(1, 5):
+        print('-' * 80, 'Training discrete model with {} layers'.format(layer_num))
+        train_discrete_model(genotype, layer_num)
+
+    print('Finished Discreet Model Training \n Logs and trained models saved at {}'.format(args.output_dir))
 
 
-DATA_PATH = './../../data/xtrains_dataset'
-DATASET = 'XTRAINS'
+MAIN_NETWORK = 'Commercial'
+FOLDER_NAME = 'Experience-name'
+COMPLEXITY = 3
+BATCH_SIZE = 32
+LR = 0.003
+MIN_LR = 0.0008
+EPOCHS = 1
+INIT_NEURONS = 16
+LAYERS = 4
+CONCEPT = 'Billboard'
 VAL_PORTION = 0.25
 TEST_PORTION = 0.5
-DATASET_SIZE = 2000
-EPOCHS = 100
+DATASET_SIZE = 100
 OUTPUT_DIR = "./outputs/"
-EXTRACTOR_PATH = './extractors/xtrains_typeA'
-LAYERS = 1
+ARCH_LR = 3e-4
+ARCH_DECAY = 1e-3
 
 if __name__ == "__main__":
     args = parse_args()
-    TIMESTAMP = "{0:%Y-%m-%dT%H-%M-%S/}".format(datetime.now())
-    CLASS_NUM = len(args.sec_labels)
+    TIMESTAMP = datetime.now().strftime('%d%m_%H%M%S')
     main()
